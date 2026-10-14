@@ -25,3 +25,46 @@
 }
 /* Biblioteca colaborativa de materiais */
 .material-card{display:block}.material-text{margin-top:16px;padding:15px;border-radius:10px;background:#0c1220;border-left:3px solid var(--purple)}.material-text strong{font-size:12px;color:#c6b7ff}.material-text p{white-space:pre-wrap;font-size:13px;line-height:1.7;color:#c2cbe0;margin:8px 0 0}.material-link{margin:15px 0 0}.material-link a{color:#9abaff;font-weight:700;font-size:13px}.material-link a:hover{text-decoration:underline}
+
+/* Correção: campos de texto mantêm o tema escuro em todas as páginas */
+input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="hidden"]),
+textarea {
+  color: var(--text);
+  background-color: #0b1120;
+  border: 1px solid #2b354c;
+  border-radius: 9px;
+  outline: none;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="hidden"])::placeholder,
+textarea::placeholder {
+  color: #7f8ba6;
+  opacity: 1;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="hidden"]):focus,
+textarea:focus {
+  border-color: #8a7aff;
+  box-shadow: 0 0 0 3px #8a7aff1b;
+}
+
+/* Impede o navegador de pintar campos com fundo cinza no preenchimento automático */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text);
+  box-shadow: 0 0 0 1000px #0b1120 inset;
+  transition: background-color 9999s ease-out;
+}
+
+/* Administração de backups */
+.backup-panel{margin:0 0 18px}
+.backup-panel h2{margin-bottom:10px}
+.backup-panel p{color:var(--muted);font-size:13px;line-height:1.7}
+.backup-panel .button{margin-top:8px}
+.backup-upload-form{display:grid;gap:13px;max-width:520px}
+.backup-upload-form label{font-size:12px;font-weight:700;color:#cbd3e7}
+.backup-upload-form input[type=file]{width:100%;padding:12px;border:1px solid var(--line);border-radius:9px;background:#0b1120;color:var(--text)}
+.backup-panel .button.danger{background:#522336;color:#ffe6ec;border-color:#74354a}
+.backup-global-notice a{text-decoration:underline;font-weight:700}
+.compact-hero{padding-bottom:20px}
