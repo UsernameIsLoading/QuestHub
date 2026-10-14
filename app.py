@@ -1,4 +1,4 @@
-import os, json, random
+import os, json, random, uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, render_template, redirect, url_for, flash, request, abort
@@ -6,7 +6,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, PasswordField, SubmitField
-from wtforms.validators import DataRequired, Length, Email, EqualTo
+from wtforms.validators import DataRequired, Length, EqualTo
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import func
 
@@ -80,12 +80,11 @@ def load_user(user_id): return db.session.get(User, int(user_id))
 
 class RegisterForm(FlaskForm):
     username = StringField('Nome de usuário', validators=[DataRequired(), Length(min=3, max=40)])
-    email = StringField('E-mail', validators=[DataRequired(), Email(), Length(max=255)])
     password = PasswordField('Senha', validators=[DataRequired(), Length(min=8, max=128)])
     confirm = PasswordField('Confirmar senha', validators=[DataRequired(), EqualTo('password', message='As senhas não coincidem.')])
     submit = SubmitField('Criar conta')
 class LoginForm(FlaskForm):
-    email = StringField('E-mail', validators=[DataRequired(), Email()])
+    username = StringField('Nome de usuário', validators=[DataRequired(), Length(min=3, max=40)])
     password = PasswordField('Senha', validators=[DataRequired()])
     submit = SubmitField('Entrar')
 
@@ -125,11 +124,13 @@ def index():
 def register():
     form = RegisterForm()
     if form.validate_on_submit():
-        username, email = form.username.data.strip(), form.email.data.strip().lower()
-        if User.query.filter(func.lower(User.username) == username.lower()).first() or User.query.filter_by(email=email).first():
-            flash('Nome de usuário ou e-mail já cadastrado.', 'error')
+        username = form.username.data.strip()
+        if User.query.filter(func.lower(User.username) == username.lower()).first():
+            flash('Nome de usuário já cadastrado.', 'error')
         else:
-            user = User(username=username, email=email); user.set_password(form.password.data)
+            # Campo interno mantido para compatibilidade com bancos já implantados; o usuário não precisa fornecer e-mail.
+            internal_email = f'{uuid.uuid4().hex}@accounts.questhub.invalid'
+            user = User(username=username, email=internal_email); user.set_password(form.password.data)
             db.session.add(user); db.session.commit(); login_user(user)
             flash('Conta criada. Bem-vindo!', 'success'); return redirect(url_for('dashboard'))
     return render_template('auth.html', form=form, mode='register')
@@ -138,10 +139,10 @@ def register():
 def login():
     form = LoginForm()
     if form.validate_on_submit():
-        user = User.query.filter_by(email=form.email.data.strip().lower()).first()
+        user = User.query.filter(func.lower(User.username) == form.username.data.strip().lower()).first()
         if user and user.check_password(form.password.data):
             login_user(user, remember=True); return redirect(request.args.get('next') or url_for('dashboard'))
-        flash('E-mail ou senha inválidos.', 'error')
+        flash('Nome de usuário ou senha inválidos.', 'error')
     return render_template('auth.html', form=form, mode='login')
 
 @app.route('/logout', methods=['POST'])

@@ -44,3 +44,7 @@ A configuração padrão usa SQLite local para facilitar o teste. Para PostgreSQ
 - O ranking conta todas as tentativas; pode-se evoluir para ranking por questões únicas ou por período.
 - A revisão é calculada pela última resposta de cada usuário. Responder novamente atualiza a data de revisão.
 - Para produção em escala, recomenda-se migrações com Flask-Migrate/Alembic, testes automatizados, recuperação de senha por e-mail e rate limiting.
+
+
+## Acesso sem e-mail
+O cadastro e o login usam apenas nome de usuário e senha. O campo de e-mail não aparece na interface; para manter compatibilidade com bancos já existentes, a aplicação gera um identificador interno não utilizável como endereço real.
