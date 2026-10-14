@@ -1,17 +1,19 @@
-import os, json, random, uuid
+import os, json, random, uuid, io
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from flask import Flask, render_template, redirect, url_for, flash, request, abort
+from flask import Flask, render_template, redirect, url_for, flash, request, abort, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf import FlaskForm, CSRFProtect
 from wtforms import StringField, PasswordField, SubmitField
 from wtforms.validators import DataRequired, Length, EqualTo
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import func
+from sqlalchemy import func, select, text
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-only-change-me')
+app.config['BACKUP_ADMIN_USERNAME'] = os.environ.get('BACKUP_ADMIN_USERNAME', '')
+app.config['DATABASE_CREATED_AT'] = os.environ.get('DATABASE_CREATED_AT', '')
 raw_db = os.environ.get('DATABASE_URL', 'sqlite:///questhub.db')
 if raw_db.startswith('postgres://'):
     raw_db = raw_db.replace('postgres://', 'postgresql://', 1)
@@ -113,7 +115,34 @@ class LoginForm(FlaskForm):
 
 @app.context_processor
 def inject_globals():
-    return {'now_utc': datetime.now(timezone.utc)}
+    return {'now_utc': datetime.now(timezone.utc), 'backup_schedule': database_backup_schedule()}
+
+
+
+def backup_admin_required():
+    """Backups include account data; restrict them to the configured owner."""
+    configured_admin = os.environ.get('BACKUP_ADMIN_USERNAME', '').strip().lower()
+    return current_user.is_authenticated and bool(configured_admin) and current_user.username.lower() == configured_admin
+
+def database_backup_schedule():
+    """Return next 30-day cycle and reminder window based on configured DB creation date."""
+    raw = os.environ.get('DATABASE_CREATED_AT', '').strip()
+    if not raw:
+        return {'configured': False, 'next_date': None, 'reminder': False, 'days_left': None}
+    try:
+        created = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        created = created.astimezone(timezone.utc)
+    except ValueError:
+        return {'configured': False, 'next_date': None, 'reminder': False, 'days_left': None}
+    cycle_days = max(1, int(os.environ.get('DATABASE_CYCLE_DAYS', '30')))
+    now = datetime.now(timezone.utc)
+    elapsed = max(0, (now - created).total_seconds())
+    cycles_elapsed = int(elapsed // (cycle_days * 86400))
+    next_date = created + timedelta(days=(cycles_elapsed + 1) * cycle_days)
+    days_left = (next_date.date() - now.date()).days
+    return {'configured': True, 'next_date': next_date, 'reminder': 0 <= days_left <= 1, 'days_left': days_left}
 
 def filtered_questions(query):
     subject = request.args.get('subject', '').strip()
@@ -367,6 +396,96 @@ def exam_result(exam_id):
         cid=answers.get(str(q.id)); chosen=next((c for c in q.choices if c.id==cid),None); correct=next((c for c in q.choices if c.is_correct),None)
         details.append({'q':q,'chosen':chosen,'correct':correct,'ok':bool(chosen and chosen.is_correct)})
     return render_template('exam_result.html', exam=exam, details=details, total=len(qs), pct=round((exam.score or 0)*100/len(qs),1) if qs else 0)
+
+@app.route('/admin/backups', methods=['GET'])
+@login_required
+def backups_page():
+    if not backup_admin_required():
+        abort(403)
+    schedule = database_backup_schedule()
+    return render_template('backups.html', schedule=schedule, table_count=len(db.metadata.sorted_tables))
+
+@app.route('/admin/backups/download', methods=['POST'])
+@login_required
+def download_backup():
+    if not backup_admin_required():
+        abort(403)
+    tables = {}
+    with db.engine.connect() as conn:
+        for table in db.metadata.sorted_tables:
+            rows = conn.execute(select(table)).mappings().all()
+            tables[table.name] = [dict(row) for row in rows]
+    # JSON format preserves every application table and explicit primary keys.
+    payload = {
+        'format': 'questhub-backup',
+        'version': 1,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'database_dialect': db.engine.dialect.name,
+        'tables': tables,
+    }
+    stream = io.BytesIO(json.dumps(payload, ensure_ascii=False, default=lambda value: value.isoformat() if hasattr(value, 'isoformat') else str(value), indent=2).encode('utf-8'))
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+    return send_file(stream, mimetype='application/json', as_attachment=True, download_name=f'questhub-backup-{stamp}.json')
+
+@app.route('/admin/backups/restore', methods=['POST'])
+@login_required
+def restore_backup():
+    if not backup_admin_required():
+        abort(403)
+    upload = request.files.get('backup_file')
+    if not upload or not upload.filename:
+        flash('Selecione um arquivo JSON de backup.', 'error')
+        return redirect(url_for('backups_page'))
+    try:
+        payload = json.load(upload.stream)
+        if payload.get('format') != 'questhub-backup' or payload.get('version') != 1 or not isinstance(payload.get('tables'), dict):
+            raise ValueError('Formato de backup não reconhecido.')
+        expected = {table.name for table in db.metadata.sorted_tables}
+        provided = set(payload['tables'])
+        if not provided.issubset(expected) or not provided:
+            raise ValueError('O arquivo contém tabelas incompatíveis com esta versão do QuestHub.')
+        for table_name, rows in payload['tables'].items():
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError(f'Dados inválidos na tabela {table_name}.')
+            table_obj = db.metadata.tables[table_name]
+            allowed_columns = {column.name for column in table_obj.columns}
+            if any(not set(row).issubset(allowed_columns) for row in rows):
+                raise ValueError(f'Colunas inválidas na tabela {table_name}.')
+            # Convert ISO strings back to native temporal values before binding to SQLAlchemy.
+            for row in rows:
+                for column in table_obj.columns:
+                    value = row.get(column.name)
+                    if value is None or not isinstance(value, str):
+                        continue
+                    try:
+                        if str(column.type).upper().startswith('DATETIME') or column.type.__class__.__name__ == 'DateTime':
+                            row[column.name] = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                        elif column.type.__class__.__name__ == 'Date':
+                            from datetime import date
+                            row[column.name] = date.fromisoformat(value)
+                    except (ValueError, TypeError):
+                        raise ValueError(f'Data inválida na coluna {table_name}.{column.name}.')
+        # A restore replaces application records. Transaction rollback protects against partial restores.
+        with db.engine.begin() as conn:
+            for table in reversed(db.metadata.sorted_tables):
+                conn.execute(table.delete())
+            for table in db.metadata.sorted_tables:
+                rows = payload['tables'].get(table.name, [])
+                if rows:
+                    conn.execute(table.insert(), rows)
+            if db.engine.dialect.name == 'postgresql':
+                for table in db.metadata.sorted_tables:
+                    pk = list(table.primary_key.columns)
+                    if len(pk) == 1 and isinstance(pk[0].type, db.Integer):
+                        seq = conn.execute(text("SELECT pg_get_serial_sequence(:table_name, :column_name)"), {'table_name': table.name, 'column_name': pk[0].name}).scalar()
+                        if seq:
+                            conn.execute(text("SELECT setval(:seq, COALESCE((SELECT MAX(" + pk[0].name + ") FROM " + table.name + "), 1), EXISTS (SELECT 1 FROM " + table.name + "))"), {'seq': seq})
+        flash('Backup restaurado com sucesso. Os dados atuais foram substituídos pelos dados do arquivo.', 'success')
+    except Exception as exc:
+        db.session.rollback()
+        app.logger.exception('Falha ao restaurar backup QuestHub')
+        flash(f'Não foi possível restaurar o backup: {exc}', 'error')
+    return redirect(url_for('backups_page'))
 
 @app.errorhandler(400)
 def bad_request(e):

@@ -58,3 +58,11 @@ O cadastro e o login usam apenas nome de usuário e senha. O campo de e-mail nã
 
 ### Catálogo de códigos de matérias
 Usuários autenticados podem abrir **Códigos** na navegação e cadastrar novos códigos (ex.: `FIS003` — Eletromagnetismo). O código é único; duplicatas são rejeitadas. A tabela `subject_code` é criada automaticamente pelo `db.create_all()` em instalações existentes, sem apagar os dados anteriores.
+
+## Backup completo e lembrete de ciclo
+
+- O menu **Backups** fica disponível somente para o usuário configurado em `BACKUP_ADMIN_USERNAME`.
+- A página permite baixar um JSON com todas as tabelas da aplicação e restaurar esse arquivo. **Restaurar substitui todos os dados atuais**; baixe uma cópia atual antes de restaurar.
+- Configure `BACKUP_ADMIN_USERNAME` nas Environment Variables do Render com o nome de usuário da conta responsável pelos backups.
+- Configure `DATABASE_CREATED_AT` com a data/hora UTC em que o banco foi criado, em ISO 8601 (ex.: `2026-10-14T12:00:00+00:00`). `DATABASE_CYCLE_DAYS` é 30 por padrão. O site mostra um aviso no dia anterior ao próximo ciclo calculado.
+- O lembrete é baseado na data configurada e não detecta nem impede a expiração real do serviço Render. Mantenha cópias baixadas fora do Render e faça backups frequentes.
