@@ -40,12 +40,35 @@ class Question(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     statement = db.Column(db.Text, nullable=False)
     subject = db.Column(db.String(100), nullable=False, index=True)
+    subject_code = db.Column(db.String(12), nullable=True)
     difficulty = db.Column(db.String(20), nullable=False, index=True)
     source = db.Column(db.String(200), nullable=False, default='Não informada', index=True)
     explanation = db.Column(db.Text)
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     choices = db.relationship('Choice', backref='question', cascade='all, delete-orphan', order_by='Choice.position')
+
+class SubjectCode(db.Model):
+    __tablename__ = 'subject_code'
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(12), unique=True, nullable=False, index=True)
+    name = db.Column(db.String(100), nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    creator = db.relationship('User')
+
+class StudyMaterial(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    subject_code = db.Column(db.String(12), nullable=False, index=True)
+    subject = db.Column(db.String(100), nullable=False)
+    title = db.Column(db.String(160), nullable=False)
+    kind = db.Column(db.String(20), nullable=False)  # link, video, summary, formulas
+    url = db.Column(db.String(1000))
+    summary = db.Column(db.Text)
+    formulas = db.Column(db.Text)
+    created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    author = db.relationship('User')
 
 class Choice(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -96,6 +119,8 @@ def filtered_questions(query):
     subject = request.args.get('subject', '').strip()
     difficulty = request.args.get('difficulty', '').strip()
     source = request.args.get('source', '').strip()
+    code = request.args.get('code', '').strip().upper()
+    if code: query = query.filter(Question.subject_code.ilike(f'%{code}%'))
     if subject: query = query.filter(Question.subject == subject)
     if difficulty in ('Fácil', 'Média', 'Difícil'): query = query.filter(Question.difficulty == difficulty)
     if source: query = query.filter(Question.source == source)
@@ -183,16 +208,17 @@ def questions():
 def new_question():
     if request.method == 'POST':
         statement = request.form.get('statement','').strip(); subject = request.form.get('subject','').strip()
+        subject_code = request.form.get('subject_code','').strip().upper()
         difficulty = request.form.get('difficulty','').strip(); source = request.form.get('source','').strip() or 'Não informada'
         explanation = request.form.get('explanation','').strip()
         texts = [t.strip() for t in request.form.getlist('choice_text[]') if t.strip()]
         correct_index = request.form.get('correct_index','')
-        if len(statement) < 5 or not subject or difficulty not in ('Fácil','Média','Difícil') or len(texts) < 2:
-            flash('Informe enunciado, assunto, dificuldade e pelo menos duas alternativas.', 'error')
+        if len(statement) < 5 or not subject or not subject_code or not __import__('re').fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code) or difficulty not in ('Fácil','Média','Difícil') or len(texts) < 2:
+            flash('Informe enunciado, assunto, código no formato FIS003, dificuldade e pelo menos duas alternativas.', 'error')
         elif not correct_index.isdigit() or int(correct_index) >= len(texts):
             flash('Selecione a alternativa correta.', 'error')
         else:
-            q = Question(statement=statement, subject=subject, difficulty=difficulty, source=source, explanation=explanation or None, created_by=current_user.id)
+            q = Question(statement=statement, subject=subject, subject_code=subject_code, difficulty=difficulty, source=source, explanation=explanation or None, created_by=current_user.id)
             db.session.add(q); db.session.flush()
             correct = int(correct_index)
             for i, text in enumerate(texts): db.session.add(Choice(question_id=q.id, text=text, is_correct=(i==correct), position=i))
@@ -216,6 +242,65 @@ def answer_question(question_id):
     db.session.add(attempt); db.session.commit()
     return render_template('answer_result.html', q=q, choice=choice, correct=choice.is_correct)
 
+
+@app.route('/subjects')
+def subjects():
+    codes = SubjectCode.query.order_by(SubjectCode.code).all()
+    return render_template('subjects.html', codes=codes)
+
+@app.route('/subjects/new', methods=['GET', 'POST'])
+@login_required
+def new_subject_code():
+    if request.method == 'POST':
+        code = request.form.get('code', '').strip().upper()
+        name = request.form.get('name', '').strip()
+        valid_code = bool(__import__('re').fullmatch(r'[A-Z]{2,5}[0-9]{3}', code))
+        if not valid_code or not name:
+            flash('Use um código com 2–5 letras e 3 números (ex.: FIS003) e informe o nome do assunto.', 'error')
+        elif SubjectCode.query.filter_by(code=code).first():
+            flash(f'O código {code} já está cadastrado. Escolha outro ou reutilize o existente.', 'error')
+        else:
+            db.session.add(SubjectCode(code=code, name=name, created_by=current_user.id))
+            db.session.commit()
+            flash(f'Código {code} cadastrado com sucesso!', 'success')
+            return redirect(url_for('materials', code=code))
+    return render_template('subject_new.html')
+
+@app.route('/materials')
+def materials():
+    code = request.args.get('code', '').strip().upper()
+    subject = request.args.get('subject', '').strip()
+    query = StudyMaterial.query
+    if code: query = query.filter(StudyMaterial.subject_code.ilike(f'%{code}%'))
+    if subject: query = query.filter(StudyMaterial.subject.ilike(f'%{subject}%'))
+    items = query.order_by(StudyMaterial.subject_code, StudyMaterial.created_at.desc()).all()
+    subjects = db.session.query(StudyMaterial.subject_code, StudyMaterial.subject).distinct().order_by(StudyMaterial.subject_code).all()
+    return render_template('materials.html', materials=items, subjects=subjects, code=code, subject=subject)
+
+@app.route('/materials/new', methods=['GET', 'POST'])
+@login_required
+def new_material():
+    if request.method == 'POST':
+        code = request.form.get('subject_code', '').strip().upper()
+        subject = request.form.get('subject', '').strip()
+        title = request.form.get('title', '').strip()
+        kind = request.form.get('kind', '').strip()
+        url = request.form.get('url', '').strip()
+        summary = request.form.get('summary', '').strip()
+        formulas = request.form.get('formulas', '').strip()
+        valid_code = bool(__import__('re').fullmatch(r'[A-Z]{2,5}[0-9]{3}', code))
+        valid_url = not url or (url.startswith('https://') or url.startswith('http://'))
+        if not valid_code or not subject or not title or kind not in ('link', 'video', 'summary', 'formulas') or not valid_url:
+            flash('Confira o código (ex.: FIS003), assunto, título, tipo e URL.', 'error')
+        elif not (url or summary or formulas):
+            flash('Adicione ao menos um link, resumo ou fórmula.', 'error')
+        else:
+            item = StudyMaterial(subject_code=code, subject=subject, title=title, kind=kind, url=url or None, summary=summary or None, formulas=formulas or None, created_by=current_user.id)
+            db.session.add(item); db.session.commit()
+            flash('Material de estudo adicionado!', 'success')
+            return redirect(url_for('materials', code=code))
+    return render_template('material_new.html')
+
 @app.route('/leaderboard')
 def leaderboard():
     users = User.query.order_by(User.username).all(); rows=[]
@@ -234,7 +319,8 @@ def exam_setup():
         try: quantity = max(1, min(100, int(request.form.get('quantity','20')))); minutes = max(1, min(180, int(request.form.get('minutes','30'))))
         except ValueError: quantity, minutes = 20, 30
         query = Question.query
-        subject=request.form.get('subject',''); difficulty=request.form.get('difficulty',''); source=request.form.get('source','')
+        subject=request.form.get('subject',''); difficulty=request.form.get('difficulty',''); source=request.form.get('source',''); code=request.form.get('code','').strip().upper()
+        if code: query=query.filter(Question.subject_code.ilike(f'%{code}%'))
         if subject: query=query.filter_by(subject=subject)
         if difficulty in ('Fácil','Média','Difícil'): query=query.filter_by(difficulty=difficulty)
         if source: query=query.filter_by(source=source)
@@ -288,6 +374,13 @@ def bad_request(e):
 
 with app.app_context():
     db.create_all()
+    # Migração leve para instalações já existentes no Render/SQLite.
+    from sqlalchemy import inspect, text
+    inspector = inspect(db.engine)
+    if 'question' in inspector.get_table_names() and 'subject_code' not in {c['name'] for c in inspector.get_columns('question')}:
+        with db.engine.begin() as conn:
+            conn.execute(text('ALTER TABLE question ADD COLUMN subject_code VARCHAR(12)'))
+            conn.execute(text('CREATE INDEX IF NOT EXISTS ix_question_subject_code ON question (subject_code)'))
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=os.environ.get('FLASK_DEBUG') == '1')

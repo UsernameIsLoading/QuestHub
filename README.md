@@ -48,3 +48,13 @@ A configuração padrão usa SQLite local para facilitar o teste. Para PostgreSQ
 
 ## Acesso sem e-mail
 O cadastro e o login usam apenas nome de usuário e senha. O campo de e-mail não aparece na interface; para manter compatibilidade com bancos já existentes, a aplicação gera um identificador interno não utilizável como endereço real.
+
+## Códigos de assunto e biblioteca de materiais
+
+- Questões agora podem receber um código de assunto no formato `FIS003` (2–5 letras e 3 números). O banco de questões aceita busca pelo código.
+- A aba **Materiais** reúne links externos, vídeos, resumos e fórmulas principais associados ao mesmo código.
+- Usuários autenticados podem publicar materiais; os materiais ficam salvos no banco de dados compartilhado.
+- Ao iniciar a versão atualizada, o app adiciona a coluna `subject_code` às tabelas de questões já existentes sem apagar as questões anteriores. Questões antigas permanecem sem código até serem atualizadas.
+
+### Catálogo de códigos de matérias
+Usuários autenticados podem abrir **Códigos** na navegação e cadastrar novos códigos (ex.: `FIS003` — Eletromagnetismo). O código é único; duplicatas são rejeitadas. A tabela `subject_code` é criada automaticamente pelo `db.create_all()` em instalações existentes, sem apagar os dados anteriores.
