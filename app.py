@@ -14,9 +14,13 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-only-change-me')
 app.config['BACKUP_ADMIN_USERNAME'] = os.environ.get('BACKUP_ADMIN_USERNAME', '')
 app.config['DATABASE_CREATED_AT'] = os.environ.get('DATABASE_CREATED_AT', '')
-raw_db = os.environ.get('DATABASE_URL', 'sqlite:///questhub.db')
+raw_db = os.environ.get('DATABASE_URL', 'sqlite:///questhub.db').strip()
+# O pacote instala psycopg v3 (psycopg[binary]); force esse driver no SQLAlchemy.
+# Sem isso, URLs postgresql:// podem tentar importar psycopg2, que não está instalado.
 if raw_db.startswith('postgres://'):
-    raw_db = raw_db.replace('postgres://', 'postgresql://', 1)
+    raw_db = raw_db.replace('postgres://', 'postgresql+psycopg://', 1)
+elif raw_db.startswith('postgresql://'):
+    raw_db = raw_db.replace('postgresql://', 'postgresql+psycopg://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = raw_db
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SESSION_COOKIE_HTTPONLY'] = True
