@@ -13,6 +13,8 @@
     <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark">Q</span> QuestHub</a>
     <div class="nav-links">
       <a href="{{ url_for('questions') }}">Questões</a>
+      <a href="{{ url_for('materials') }}">Materiais</a>
+      <a href="{{ url_for('subjects') }}">Códigos</a>
       <a href="{{ url_for('exam_setup') }}">Modo prova</a>
       <a href="{{ url_for('leaderboard') }}">Ranking</a>
       {% if current_user.is_authenticated %}
