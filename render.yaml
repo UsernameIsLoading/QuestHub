@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: questhub
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: questhub-db
+          property: connectionString
+      - key: COOKIE_SECURE
+        value: "true"
+databases:
+  - name: questhub-db
+    plan: free
