@@ -1,0 +1,41 @@
+{% extends 'base.html' %}
+{% block title %}Backups do banco — QuestHub{% endblock %}
+{% block content %}
+<section class="hero compact-hero">
+  <p class="eyebrow">ADMINISTRAÇÃO</p>
+  <h1>Backups do banco<span class="accent">.</span></h1>
+  <p>Exporte ou restaure os dados do QuestHub: contas, questões, alternativas, materiais, códigos, tentativas e provas.</p>
+</section>
+<section class="panel backup-panel">
+  <h2>Baixar backup completo</h2>
+  <p>Gera um arquivo JSON com todas as tabelas da aplicação, incluindo os IDs e as senhas em formato de hash. Guarde-o em local privado.</p>
+  <form method="post" action="{{ url_for('download_backup') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-primary" type="submit">Baixar todos os dados (.json)</button>
+  </form>
+</section>
+<section class="panel backup-panel">
+  <h2>Restaurar backup</h2>
+  <p><strong>Atenção:</strong> restaurar substitui os dados atuais pelos dados do arquivo. Baixe um backup atual antes de continuar e não envie arquivos de origem desconhecida.</p>
+  <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data" class="backup-upload-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="backup_file">Arquivo de backup QuestHub (.json)</label>
+    <input id="backup_file" name="backup_file" type="file" accept=".json,application/json" required>
+    <button class="btn btn-danger" type="submit" onclick="return confirm('Isso substituirá todos os dados atuais pelo conteúdo do backup. Você já baixou uma cópia dos dados atuais?')">Restaurar banco</button>
+  </form>
+</section>
+<section class="panel backup-panel">
+  <h2>Lembrete de ciclo do banco</h2>
+  {% if schedule.configured %}
+    {% if schedule.reminder %}
+      <p class="flash error">⚠️ Atenção: o próximo ciclo está a {{ schedule.days_left }} dia(s). Baixe um backup agora.</p>
+    {% else %}
+      <p>Próxima data calculada para o ciclo: <strong>{{ schedule.next_date.strftime('%d/%m/%Y às %H:%M UTC') }}</strong>.</p>
+      <p>O aviso aparece nesta página e no site no dia anterior ao ciclo.</p>
+    {% endif %}
+  {% else %}
+    <p class="flash info">O lembrete ainda não está configurado. No Render, defina <code>DATABASE_CREATED_AT</code> com a data/hora UTC de criação do banco, por exemplo <code>2026-10-14T12:00:00+00:00</code>. O ciclo padrão é de 30 dias; pode ser alterado com <code>DATABASE_CYCLE_DAYS</code>.</p>
+  {% endif %}
+  <p class="muted">Este lembrete é calculado pela data configurada. Ele não detecta nem impede a expiração automática do Render. Faça backups externos com frequência.</p>
+</section>
+{% endblock %}

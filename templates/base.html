@@ -18,6 +18,7 @@
       <a href="{{ url_for('exam_setup') }}">Modo prova</a>
       <a href="{{ url_for('leaderboard') }}">Ranking</a>
       {% if current_user.is_authenticated %}
+        {% if current_user.username|lower == config.get('BACKUP_ADMIN_USERNAME', '')|lower and config.get('BACKUP_ADMIN_USERNAME') %}<a href="{{ url_for('backups_page') }}">Backups</a>{% endif %}
         <a href="{{ url_for('dashboard') }}">Meu painel</a>
         <form method="post" action="{{ url_for('logout') }}" class="nav-inline-form"><button class="nav-cta" type="submit">Sair</button></form>
       {% else %}
@@ -31,6 +32,9 @@
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}<div class="flashes">{% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}
   {% endwith %}
+  {% if current_user.is_authenticated and current_user.username|lower == config.get('BACKUP_ADMIN_USERNAME', '')|lower and config.get('BACKUP_ADMIN_USERNAME') and backup_schedule.reminder %}
+    <div class="flash error backup-global-notice">⚠️ O ciclo do banco está próximo ({{ backup_schedule.days_left }} dia(s)). Baixe um backup agora em <a href="{{ url_for('backups_page') }}">Backups</a>.</div>
+  {% endif %}
   {% block content %}{% endblock %}
 </main>
 <footer class="container">QuestHub <span>•</span> Aprenda um pouco todos os dias.</footer>
