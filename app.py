@@ -52,6 +52,7 @@ class Question(db.Model):
     explanation = db.Column(db.Text)
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    review_status = db.Column(db.String(30), nullable=False, default='Revisada', index=True)
     choices = db.relationship('Choice', backref='question', cascade='all, delete-orphan', order_by='Choice.position')
 
 class SubjectCode(db.Model):
@@ -152,11 +153,13 @@ def filtered_questions(query):
     subject = request.args.get('subject', '').strip()
     difficulty = request.args.get('difficulty', '').strip()
     source = request.args.get('source', '').strip()
+    review = request.args.get('review', '').strip()
     code = request.args.get('code', '').strip().upper()
     if code: query = query.filter(Question.subject_code.ilike(f'%{code}%'))
     if subject: query = query.filter(Question.subject == subject)
     if difficulty in ('Fácil', 'Média', 'Difícil'): query = query.filter(Question.difficulty == difficulty)
     if source: query = query.filter(Question.source == source)
+    if review in ('Revisada', 'Não revisada'): query = query.filter(Question.review_status == review)
     return query
 
 def question_options():
@@ -228,6 +231,133 @@ def dashboard():
             q = db.session.get(Question, qid)
             if q: due.append(q)
     return render_template('dashboard.html', total=total, correct=correct, pct=round(correct*100/total,1) if total else 0, unique_answered=unique_answered, by_subject=by_subject, due=due[:8])
+
+
+@app.route('/questions/import', methods=['GET', 'POST'])
+@login_required
+def import_questions():
+    """Bulk-import questions from a text-based PDF and a separate/pasted answer key."""
+    import re
+    from werkzeug.utils import secure_filename
+    if request.method == 'POST':
+        pdf = request.files.get('pdf_file')
+        subject = (request.form.get('subject') or 'Questões importadas').strip()[:100]
+        subject_code = (request.form.get('subject_code') or 'IMP001').strip().upper()
+        difficulty = request.form.get('difficulty', 'Média')
+        source = (request.form.get('source') or 'PDF importado').strip()[:200]
+        answer_text = request.form.get('answer_key', '')
+        if not pdf or not pdf.filename.lower().endswith('.pdf'):
+            flash('Selecione um arquivo PDF.', 'error')
+            return render_template('import_questions.html')
+        if not re.fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code):
+            flash('O código deve seguir o formato FIS003 (2–5 letras e 3 números).', 'error')
+            return render_template('import_questions.html')
+        if difficulty not in ('Fácil', 'Média', 'Difícil'):
+            difficulty = 'Média'
+        # Primeiro tenta extrair texto digital. Páginas sem texto útil passam pelo OCR.
+        used_ocr = False
+        try:
+            from pypdf import PdfReader
+            from io import BytesIO
+            pdf_bytes = pdf.read()
+            reader = PdfReader(BytesIO(pdf_bytes))
+            pages = []
+            for page in reader.pages:
+                pages.append((page.extract_text() or '').strip())
+
+            # OCR só nas páginas sem texto selecionável, mantendo a ordem original.
+            pages_needing_ocr = [i for i, page_text in enumerate(pages) if len(page_text) < 30]
+            if pages_needing_ocr:
+                try:
+                    import fitz  # PyMuPDF: renderiza páginas do PDF sem depender do Poppler.
+                    import pytesseract
+                    from PIL import Image
+                    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+                    for page_index in pages_needing_ocr:
+                        page = doc.load_page(page_index)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                        image = Image.open(BytesIO(pix.tobytes('png')))
+                        try:
+                            ocr_text = pytesseract.image_to_string(image, lang='por+eng', config='--psm 3')
+                        except Exception:
+                            # Algumas instalações podem não ter o pacote de idioma português.
+                            ocr_text = pytesseract.image_to_string(image, lang='eng', config='--psm 3')
+                        pages[page_index] = ocr_text.strip()
+                        used_ocr = used_ocr or len(ocr_text.strip()) > 0
+                    doc.close()
+                except Exception as ocr_exc:
+                    if not any(len(t) >= 30 for t in pages):
+                        flash('O PDF parece escaneado, mas o OCR não pôde ser executado. No Render, confirme que tesseract-ocr e tesseract-ocr-por estão instalados. Detalhe: ' + str(ocr_exc)[:160], 'error')
+                        return render_template('import_questions.html')
+            full_text = '\n'.join(pages)
+        except Exception as exc:
+            flash('Não foi possível ler o PDF. Verifique se ele não está corrompido. Detalhe: ' + str(exc)[:180], 'error')
+            return render_template('import_questions.html')
+        if len(full_text.strip()) < 30:
+            flash('Não foi possível extrair texto suficiente do PDF, mesmo após tentar OCR. Verifique a qualidade/resolução das páginas.', 'error')
+            return render_template('import_questions.html')
+        if used_ocr:
+            flash('OCR foi usado em uma ou mais páginas. Como o reconhecimento pode confundir letras e números, as questões importadas deste PDF serão marcadas como “Não revisada”.', 'info')
+        # Answer keys like "1-A 2-C", "1. A", or one answer per line.
+        answer_text = (answer_text or '') + '\n' + full_text
+        answers = {}
+        for m in re.finditer(r'(?im)(?:quest[aã]o\s*)?(\d{1,4})\s*[\.\)\-:]\s*([A-E])\b', answer_text):
+            answers[int(m.group(1))] = m.group(2).upper()
+        # Separate question body from a trailing answer-key section where possible.
+        body = re.split(r'(?im)^\s*(?:gabarito|respostas?\s+corretas)\s*:?\s*$', full_text)[0]
+        starts = list(re.finditer(r'(?m)^\s*(\d{1,4})\s*[\.\)]\s+', body))
+        if not starts:
+            flash('Não consegui identificar a numeração das questões. Nenhuma questão foi importada.', 'error')
+            return render_template('import_questions.html')
+        imported = uncertain = duplicates = 0
+        seen = set()
+        for idx, start in enumerate(starts):
+            qnum = int(start.group(1))
+            end = starts[idx+1].start() if idx+1 < len(starts) else len(body)
+            chunk = body[start.end():end].strip()
+            # Detect multiple-choice options labelled A) / A. / (A)
+            option_matches = list(re.finditer(r'(?im)(?:^|\n)\s*(?:\(([A-E])\)|([A-E])[\)\.])\s+', chunk))
+            statement = chunk[:option_matches[0].start()].strip() if option_matches else chunk
+            choices = []
+            for oi, om in enumerate(option_matches):
+                label = (om.group(1) or om.group(2)).upper()
+                cend = option_matches[oi+1].start() if oi+1 < len(option_matches) else len(chunk)
+                ctext = chunk[om.end():cend].strip()
+                # Avoid empty alternatives and common page/header noise.
+                if ctext:
+                    choices.append((label, ctext))
+            statement = re.sub(r'\s+', ' ', statement).strip()
+            norm = re.sub(r'\W+', '', statement.lower())
+            if len(statement) < 15 or norm in seen:
+                duplicates += 1
+                continue
+            seen.add(norm)
+            valid_choices = len(choices) >= 2 and len(choices) <= 5
+            correct_label = answers.get(qnum)
+            labels = [c[0] for c in choices]
+            status = 'Revisada'
+            if used_ocr or len(statement) < 35 or not valid_choices or not correct_label or correct_label not in labels:
+                status = 'Não revisada'
+            q = Question(statement=statement, subject=subject, subject_code=subject_code,
+                         difficulty=difficulty, source=source, created_by=current_user.id,
+                         review_status=status,
+                         explanation='Importada automaticamente do PDF. Confira o enunciado e o gabarito.' if status == 'Não revisada' else None)
+            db.session.add(q); db.session.flush()
+            if valid_choices:
+                for pos, (label, ctext) in enumerate(choices):
+                    db.session.add(Choice(question_id=q.id, text=ctext,
+                                          is_correct=(correct_label is not None and label == correct_label),
+                                          position=pos))
+            else:
+                # Keep the question in the bank even when alternatives could not be parsed.
+                db.session.add(Choice(question_id=q.id, text='Alternativa não identificada automaticamente — revisar PDF original.', is_correct=False, position=0))
+                db.session.add(Choice(question_id=q.id, text='Alternativa não identificada automaticamente — revisar PDF original.', is_correct=False, position=1))
+            imported += 1
+            if status == 'Não revisada': uncertain += 1
+        db.session.commit()
+        flash(f'Importação concluída: {imported} questão(ões) adicionada(s), {uncertain} marcada(s) como “Não revisada” e {duplicates} ignorada(s) por possível duplicidade/extração inválida.', 'success')
+        return redirect(url_for('questions', review='Não revisada'))
+    return render_template('import_questions.html')
 
 @app.route('/questions')
 def questions():
@@ -507,3 +637,18 @@ with app.app_context():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=os.environ.get('FLASK_DEBUG') == '1')
+
+
+# Safe additive migration for existing databases (does not delete or rewrite questions).
+with app.app_context():
+    db.create_all()
+    try:
+        from sqlalchemy import inspect
+        inspector = inspect(db.engine)
+        if 'question' in inspector.get_table_names():
+            cols = {c['name'] for c in inspector.get_columns('question')}
+            if 'review_status' not in cols:
+                with db.engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE question ADD COLUMN review_status VARCHAR(30) NOT NULL DEFAULT 'Revisada'"))
+    except Exception as migration_error:
+        app.logger.warning("Question review-status migration will retry on next startup: %s", migration_error)
