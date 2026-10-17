@@ -180,23 +180,30 @@ def question_options():
       'difficulties': ['Fácil', 'Média', 'Difícil']
     }
 
-def openai_json(system_prompt, user_prompt, schema_name, schema):
-    """Call OpenAI server-side; API key is never exposed to the browser."""
-    api_key = os.environ.get('OPENAI_API_KEY', '').strip()
+def gemini_json(system_prompt, user_prompt, schema_name, schema):
+    """Call Gemini server-side using JSON output; API key stays on the server."""
+    api_key = os.environ.get('GEMINI_API_KEY', '').strip()
     if not api_key:
-        raise RuntimeError('A chave OPENAI_API_KEY não está configurada no servidor.')
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model=os.environ.get('OPENAI_MODEL', 'gpt-4o-mini'),
-        messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}],
-        response_format={'type': 'json_schema', 'json_schema': {'name': schema_name, 'strict': True, 'schema': schema}},
-        temperature=0.2,
+        raise RuntimeError('A chave GEMINI_API_KEY não está configurada no servidor.')
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash'),
+        contents=f'{system_prompt}\n\n{user_prompt}',
+        config=types.GenerateContentConfig(
+            response_mime_type='application/json',
+            response_schema=schema,
+            temperature=0.2,
+        ),
     )
-    content = response.choices[0].message.content
+    content = getattr(response, 'text', None)
     if not content:
-        raise RuntimeError('A IA não retornou conteúdo. Tente novamente.')
-    return json.loads(content)
+        raise RuntimeError('O Gemini não retornou conteúdo. Tente novamente.')
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError('O Gemini retornou uma resposta JSON inválida.') from exc
 
 QUESTION_SCHEMA = {
     'type': 'object', 'additionalProperties': False,
@@ -298,6 +305,7 @@ def import_questions():
         difficulty = request.form.get('difficulty', 'Média')
         source = (request.form.get('source') or 'PDF importado').strip()[:200]
         answer_text = request.form.get('answer_key', '')
+        answer_pdf = request.files.get('answer_pdf')
         selected_type = request.form.get('question_type', 'multiple_choice')
         if selected_type not in ('multiple_choice', 'essay'):
             selected_type = 'multiple_choice'
@@ -361,10 +369,55 @@ def import_questions():
             return render_template('import_questions.html')
         if used_ocr:
             flash('OCR foi usado em uma ou mais páginas. Como o reconhecimento pode confundir letras e números, as questões importadas deste PDF serão marcadas como “Não revisada”.', 'info')
+        # O gabarito pode ser colado no campo de texto ou enviado em PDF separado.
+        answer_pdf_text = ''
+        if answer_pdf and answer_pdf.filename:
+            if not answer_pdf.filename.lower().endswith('.pdf'):
+                flash('O arquivo de gabarito separado precisa estar em PDF.', 'error')
+                return render_template('import_questions.html')
+            try:
+                from pypdf import PdfReader
+                from io import BytesIO
+                answer_pdf_bytes = answer_pdf.read()
+                answer_reader = PdfReader(BytesIO(answer_pdf_bytes))
+                answer_pages = [(page.extract_text() or '').strip() for page in answer_reader.pages]
+                answer_pdf_text = '\n'.join(answer_pages)
+                # Tenta OCR quando o gabarito for escaneado ou não tiver texto selecionável.
+                if len(answer_pdf_text.strip()) < 5:
+                    try:
+                        import fitz, pytesseract, shutil
+                        from PIL import Image, ImageOps, ImageFilter
+                        tess_cmd = shutil.which('tesseract')
+                        if not tess_cmd:
+                            raise RuntimeError('Tesseract não está instalado no servidor.')
+                        pytesseract.pytesseract.tesseract_cmd = tess_cmd
+                        answer_doc = fitz.open(stream=answer_pdf_bytes, filetype='pdf')
+                        ocr_pages = []
+                        for page in answer_doc:
+                            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+                            image = ImageOps.autocontrast(Image.open(BytesIO(pix.tobytes('png'))).convert('L')).filter(ImageFilter.SHARPEN)
+                            try:
+                                langs = pytesseract.get_languages(config='')
+                                lang = 'por+eng' if 'por' in langs and 'eng' in langs else ('por' if 'por' in langs else 'eng')
+                                txt = pytesseract.image_to_string(image, lang=lang, config='--oem 3 --psm 6')
+                            except Exception:
+                                txt = pytesseract.image_to_string(image, config='--oem 3 --psm 6')
+                            ocr_pages.append(txt.strip())
+                        answer_doc.close()
+                        answer_pdf_text = '\n'.join(ocr_pages)
+                    except Exception as ocr_key_exc:
+                        raise RuntimeError('Não foi possível extrair o gabarito em texto nem por OCR: ' + str(ocr_key_exc)[:160])
+                if len(answer_pdf_text.strip()) < 5:
+                    flash('Não consegui extrair texto suficiente do PDF de gabarito. Confira a qualidade do arquivo ou cole as respostas no campo de texto.', 'error')
+                    return render_template('import_questions.html')
+            except Exception as key_exc:
+                flash('Não foi possível ler o PDF de gabarito: ' + str(key_exc)[:180], 'error')
+                return render_template('import_questions.html')
+        answer_text = (answer_text or '') + '\n' + answer_pdf_text
         if request.form.get('ai_process') == 'yes':
             try:
-                parsed = openai_json(
-                    'Você organiza questões educacionais extraídas de PDFs. Preserve fielmente o texto disponível, não invente dados ausentes e não deduza gabaritos sem evidência. Para questão objetiva, use labels A-E e deixe correct_label vazio se não houver gabarito explícito. Para discursivas, use expected_answer vazio se não houver resposta de referência. Retorne somente o schema solicitado.',
+                parsed = gemini_json(
+                    'Você organiza questões educacionais extraídas de PDFs. Preserve fielmente o texto, não invente dados ausentes e não deduza gabaritos sem evidência. Analise o gabarito fornecido separadamente, associe os números às questões e confira se as letras correspondem às alternativas disponíveis. Se houver conflito, ambiguidade ou resposta ilegível, não escolha silenciosamente: deixe correct_label vazio. Para questão objetiva, use labels A-E; para discursivas, deixe expected_answer vazio se não houver resposta de referência. Retorne somente o schema solicitado.',
                     f'Tipo solicitado: {selected_type}. Matéria: {subject}. Dificuldade padrão: {difficulty}. Texto extraído do PDF (pode conter erros de OCR):\n{full_text[:45000]}\nGabarito informado pelo usuário (se houver):\n{answer_text[:10000]}',
                     'questhub_pdf_questions', QUESTION_SCHEMA)
                 preview = []
@@ -513,7 +566,7 @@ def ai_correct_question(question_id):
         return redirect(url_for('question_detail', question_id=q.id))
     try:
         choices_text = '\n'.join(f'{chr(65+i)}. {c.text}' for i,c in enumerate(q.choices))
-        result = openai_json(
+        result = gemini_json(
             'Você é um avaliador educacional cuidadoso. Avalie a resposta do estudante com base no enunciado e em conhecimento confiável. Se faltar contexto, avise. Não finja que existe gabarito oficial. Dê feedback formativo, não apenas certo/errado.',
             f'Enunciado: {q.statement}\nAlternativas (se houver):\n{choices_text}\nResposta de referência cadastrada (se houver): {q.expected_answer or "nenhuma"}\nExplicação existente: {q.explanation or "nenhuma"}\nResposta do estudante: {answer}\nMatéria: {q.subject}',
             'questhub_ai_feedback', FEEDBACK_SCHEMA)
@@ -539,7 +592,7 @@ def create_ai_questions(subject):
         if kind not in ('multiple_choice','essay'): kind = 'multiple_choice'
         context = '\n\n'.join([f'Questão existente: {q.statement}\nAlternativas: ' + '; '.join(c.text for c in q.choices) for q in sample])
         try:
-            parsed = openai_json(
+            parsed = gemini_json(
                 'Crie questões educacionais originais em português, alinhadas ao assunto e ao nível inferido dos exemplos. Não copie literalmente os exemplos. Para múltipla escolha, crie 4 alternativas e um único gabarito correto. Para discursivas, não inclua alternativas. Explicações devem ser concisas. Retorne apenas o schema.',
                 f'Assunto: {subject}. Tipo: {kind}. Quantidade: {amount}. Exemplos de questões já existentes para orientar escopo e dificuldade:\n{context[:18000]}',
                 'questhub_generated_questions', QUESTION_SCHEMA)
