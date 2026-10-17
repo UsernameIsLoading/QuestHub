@@ -11,7 +11,7 @@
   <p>Gera um arquivo JSON com todas as tabelas da aplicação, incluindo os IDs e as senhas em formato de hash. Guarde-o em local privado.</p>
   <form method="post" action="{{ url_for('download_backup') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button class="btn btn-primary" type="submit">Baixar todos os dados (.json)</button>
+    <button class="button primary" type="submit">Baixar todos os dados (.json)</button>
   </form>
 </section>
 <section class="panel backup-panel">
@@ -21,7 +21,17 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label for="backup_file">Arquivo de backup QuestHub (.json)</label>
     <input id="backup_file" name="backup_file" type="file" accept=".json,application/json" required>
-    <button class="btn btn-danger" type="submit" onclick="return confirm('Isso substituirá todos os dados atuais pelo conteúdo do backup. Você já baixou uma cópia dos dados atuais?')">Restaurar banco</button>
+    <button class="button danger" type="submit" onclick="return confirm('Isso substituirá todos os dados atuais pelo conteúdo do backup. Você já baixou uma cópia dos dados atuais?')">Restaurar banco</button>
+  </form>
+</section>
+<section class="panel backup-panel admin-reset-panel">
+  <h2>Resetar banco de estudos</h2>
+  <p>Apaga todas as questões, alternativas, tentativas, respostas dissertativas, materiais, códigos de assunto e simulados. <strong>As contas de usuário e o acesso do administrador serão preservados.</strong> Esta ação não pode ser desfeita.</p>
+  <form method="post" action="{{ url_for('admin_reset_database') }}" class="reset-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="reset-confirmation">Digite <code>RESETAR</code> para confirmar</label>
+    <input id="reset-confirmation" name="confirmation" required pattern="RESETAR" autocomplete="off" placeholder="RESETAR">
+    <button class="button danger" type="submit" onclick="return confirm('Confirma apagar todo o conteúdo de estudos e o progresso? As contas serão preservadas.')">Resetar banco de estudos</button>
   </form>
 </section>
 <section class="panel backup-panel">
