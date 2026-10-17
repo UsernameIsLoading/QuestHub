@@ -66,3 +66,20 @@ Usuários autenticados podem abrir **Códigos** na navegação e cadastrar novos
 - Configure `BACKUP_ADMIN_USERNAME` nas Environment Variables do Render com o nome de usuário da conta responsável pelos backups.
 - Configure `DATABASE_CREATED_AT` com a data/hora UTC em que o banco foi criado, em ISO 8601 (ex.: `2026-10-14T12:00:00+00:00`). `DATABASE_CYCLE_DAYS` é 30 por padrão. O site mostra um aviso no dia anterior ao próximo ciclo calculado.
 - O lembrete é baseado na data configurada e não detecta nem impede a expiração real do serviço Render. Mantenha cópias baixadas fora do Render e faça backups frequentes.
+
+## Recursos opcionais de IA (QuestHub)
+
+Para ativar a organização de PDFs por IA, correção opcional de questões sem gabarito e geração de novas questões:
+
+1. Adicione `OPENAI_API_KEY` nas variáveis de ambiente do serviço no Render. Nunca coloque a chave no HTML, JavaScript ou em um repositório público.
+2. Opcionalmente configure `OPENAI_MODEL` (padrão: `gpt-4o-mini`).
+3. Faça um novo deploy para instalar a dependência `openai` declarada em `requirements.txt`.
+4. A chave da API precisa ter acesso e saldo/limite de uso configurados na plataforma OpenAI. O uso pode gerar custos.
+
+### Fluxos
+
+- **Importar PDF com IA:** marque a opção de organização por IA. O sistema mostra uma prévia e só grava as questões depois da aprovação explícita. O importador tradicional continua disponível.
+- **Correção por IA:** depois de responder uma questão sem gabarito ou sem resposta de referência, o usuário pode escolher pedir uma análise. A sugestão não é gabarito oficial; respostas de múltipla escolha sem chave não entram na pontuação automática.
+- **Criar questões com IA:** ao filtrar um assunto com mais de 10 questões existentes, usuários conectados veem a opção de gerar de 1 a 10 questões. A prévia precisa ser aprovada e as questões salvas recebem a tag “Elaborada por IA” e o estado “Não revisada”.
+
+As funções de IA não apagam nem substituem questões existentes. Questões geradas devem ser verificadas por uma pessoa antes de serem usadas como material definitivo.

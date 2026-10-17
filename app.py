@@ -1,4 +1,4 @@
-import os, json, random, uuid, io
+import os, json, random, uuid, io, re
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, render_template, redirect, url_for, flash, request, abort, send_file
@@ -53,6 +53,9 @@ class Question(db.Model):
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     review_status = db.Column(db.String(30), nullable=False, default='Revisada', index=True)
+    question_type = db.Column(db.String(24), nullable=False, default='multiple_choice', index=True)
+    expected_answer = db.Column(db.Text)
+    ai_generated = db.Column(db.Boolean, nullable=False, default=False, index=True)
     choices = db.relationship('Choice', backref='question', cascade='all, delete-orphan', order_by='Choice.position')
 
 class SubjectCode(db.Model):
@@ -94,6 +97,14 @@ class Attempt(db.Model):
     mode = db.Column(db.String(10), nullable=False, default='study')
     question = db.relationship('Question')
     choice = db.relationship('Choice')
+
+class EssayResponse(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    question_id = db.Column(db.Integer, db.ForeignKey('question.id'), nullable=False, index=True)
+    answer_text = db.Column(db.Text, nullable=False)
+    submitted_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    question = db.relationship('Question')
 
 class ExamSession(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -169,6 +180,47 @@ def question_options():
       'difficulties': ['Fácil', 'Média', 'Difícil']
     }
 
+def openai_json(system_prompt, user_prompt, schema_name, schema):
+    """Call OpenAI server-side; API key is never exposed to the browser."""
+    api_key = os.environ.get('OPENAI_API_KEY', '').strip()
+    if not api_key:
+        raise RuntimeError('A chave OPENAI_API_KEY não está configurada no servidor.')
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model=os.environ.get('OPENAI_MODEL', 'gpt-4o-mini'),
+        messages=[{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}],
+        response_format={'type': 'json_schema', 'json_schema': {'name': schema_name, 'strict': True, 'schema': schema}},
+        temperature=0.2,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError('A IA não retornou conteúdo. Tente novamente.')
+    return json.loads(content)
+
+QUESTION_SCHEMA = {
+    'type': 'object', 'additionalProperties': False,
+    'properties': {'questions': {'type': 'array', 'items': {
+        'type': 'object', 'additionalProperties': False,
+        'properties': {
+            'number': {'type': 'integer'}, 'statement': {'type': 'string'},
+            'question_type': {'type': 'string', 'enum': ['multiple_choice', 'essay']},
+            'choices': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
+                'properties': {'label': {'type': 'string'}, 'text': {'type': 'string'}}, 'required': ['label', 'text']}},
+            'correct_label': {'type': 'string'}, 'expected_answer': {'type': 'string'},
+            'explanation': {'type': 'string'},
+        }, 'required': ['number', 'statement', 'question_type', 'choices', 'correct_label', 'expected_answer', 'explanation']
+    }}}
+    , 'required': ['questions']
+}
+
+FEEDBACK_SCHEMA = {
+    'type': 'object', 'additionalProperties': False,
+    'properties': {'suggested_answer': {'type': 'string'}, 'assessment': {'type': 'string'},
+                   'explanation': {'type': 'string'}, 'confidence': {'type': 'string', 'enum': ['baixa', 'média', 'alta']}},
+    'required': ['suggested_answer', 'assessment', 'explanation', 'confidence']
+}
+
 def recent_status(user_id, question_id):
     attempt = Attempt.query.filter_by(user_id=user_id, question_id=question_id).order_by(Attempt.answered_at.desc()).first()
     if not attempt: return None
@@ -214,13 +266,13 @@ def logout(): logout_user(); flash('Você saiu da conta.', 'info'); return redir
 @login_required
 def dashboard():
     attempts = Attempt.query.filter_by(user_id=current_user.id).all()
-    total = len(attempts); correct = sum(a.is_correct for a in attempts)
+    total = len(attempts); correct = sum(a.is_correct is True for a in attempts)
     unique_answered = len({a.question_id for a in attempts})
     by_subject = {}
     for a in attempts:
         key = a.question.subject
         by_subject.setdefault(key, {'total': 0, 'correct': 0})
-        by_subject[key]['total'] += 1; by_subject[key]['correct'] += int(a.is_correct)
+        by_subject[key]['total'] += 1; by_subject[key]['correct'] += int(a.is_correct is True)
     due = []
     latest = {}
     for a in sorted(attempts, key=lambda x: x.answered_at): latest[a.question_id] = a
@@ -246,6 +298,9 @@ def import_questions():
         difficulty = request.form.get('difficulty', 'Média')
         source = (request.form.get('source') or 'PDF importado').strip()[:200]
         answer_text = request.form.get('answer_key', '')
+        selected_type = request.form.get('question_type', 'multiple_choice')
+        if selected_type not in ('multiple_choice', 'essay'):
+            selected_type = 'multiple_choice'
         if not pdf or not pdf.filename.lower().endswith('.pdf'):
             flash('Selecione um arquivo PDF.', 'error')
             return render_template('import_questions.html')
@@ -271,24 +326,32 @@ def import_questions():
                 try:
                     import fitz  # PyMuPDF: renderiza páginas do PDF sem depender do Poppler.
                     import pytesseract
-                    from PIL import Image
+                    import shutil
+                    from PIL import Image, ImageOps, ImageFilter
+                    tess_cmd = shutil.which('tesseract')
+                    if not tess_cmd:
+                        raise RuntimeError('Executável tesseract ausente. Configure o build do Render para instalar tesseract-ocr e tesseract-ocr-por.')
+                    pytesseract.pytesseract.tesseract_cmd = tess_cmd
                     doc = fitz.open(stream=pdf_bytes, filetype='pdf')
                     for page_index in pages_needing_ocr:
                         page = doc.load_page(page_index)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                        image = Image.open(BytesIO(pix.tobytes('png')))
+                        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+                        image = Image.open(BytesIO(pix.tobytes('png'))).convert('L')
+                        image = ImageOps.autocontrast(image).filter(ImageFilter.SHARPEN)
                         try:
-                            ocr_text = pytesseract.image_to_string(image, lang='por+eng', config='--psm 3')
-                        except Exception:
-                            # Algumas instalações podem não ter o pacote de idioma português.
-                            ocr_text = pytesseract.image_to_string(image, lang='eng', config='--psm 3')
+                            langs = pytesseract.get_languages(config='')
+                            lang = 'por+eng' if 'por' in langs and 'eng' in langs else ('por' if 'por' in langs else 'eng')
+                            # Layouts de prova variam; tenta dois modos e conserva o texto mais legível.
+                            candidates = [pytesseract.image_to_string(image, lang=lang, config=f'--oem 3 --psm {psm}') for psm in (3, 6)]
+                            ocr_text = max(candidates, key=lambda value: sum(ch.isalnum() for ch in value))
+                        except Exception as lang_exc:
+                            raise RuntimeError('Tesseract foi encontrado, mas falhou ao carregar idiomas OCR: ' + str(lang_exc)[:140])
                         pages[page_index] = ocr_text.strip()
                         used_ocr = used_ocr or len(ocr_text.strip()) > 0
                     doc.close()
                 except Exception as ocr_exc:
-                    if not any(len(t) >= 30 for t in pages):
-                        flash('O PDF parece escaneado, mas o OCR não pôde ser executado. No Render, confirme que tesseract-ocr e tesseract-ocr-por estão instalados. Detalhe: ' + str(ocr_exc)[:160], 'error')
-                        return render_template('import_questions.html')
+                    flash('O OCR não conseguiu processar uma ou mais páginas escaneadas. O deploy precisa instalar o executável Tesseract e os idiomas por/eng. Detalhe: ' + str(ocr_exc)[:220], 'error')
+                    return render_template('import_questions.html')
             full_text = '\n'.join(pages)
         except Exception as exc:
             flash('Não foi possível ler o PDF. Verifique se ele não está corrompido. Detalhe: ' + str(exc)[:180], 'error')
@@ -298,6 +361,39 @@ def import_questions():
             return render_template('import_questions.html')
         if used_ocr:
             flash('OCR foi usado em uma ou mais páginas. Como o reconhecimento pode confundir letras e números, as questões importadas deste PDF serão marcadas como “Não revisada”.', 'info')
+        if request.form.get('ai_process') == 'yes':
+            try:
+                parsed = openai_json(
+                    'Você organiza questões educacionais extraídas de PDFs. Preserve fielmente o texto disponível, não invente dados ausentes e não deduza gabaritos sem evidência. Para questão objetiva, use labels A-E e deixe correct_label vazio se não houver gabarito explícito. Para discursivas, use expected_answer vazio se não houver resposta de referência. Retorne somente o schema solicitado.',
+                    f'Tipo solicitado: {selected_type}. Matéria: {subject}. Dificuldade padrão: {difficulty}. Texto extraído do PDF (pode conter erros de OCR):\n{full_text[:45000]}\nGabarito informado pelo usuário (se houver):\n{answer_text[:10000]}',
+                    'questhub_pdf_questions', QUESTION_SCHEMA)
+                preview = []
+                for item in parsed.get('questions', [])[:100]:
+                    statement = str(item.get('statement', '')).strip()[:10000]
+                    qtype = item.get('question_type')
+                    choices = item.get('choices', []) if qtype == 'multiple_choice' else []
+                    if len(statement) < 10 or qtype not in ('multiple_choice', 'essay'):
+                        continue
+                    if selected_type != qtype:
+                        qtype = selected_type
+                        choices = [] if qtype == 'essay' else choices
+                    if qtype == 'multiple_choice':
+                        choices = [{'label': str(c.get('label',''))[:2].upper(), 'text': str(c.get('text','')).strip()[:3000]} for c in choices[:5] if str(c.get('text','')).strip()]
+                        if len(choices) < 2: continue
+                    preview.append({'number': int(item.get('number', len(preview)+1)), 'statement': statement,
+                                    'question_type': qtype, 'choices': choices,
+                                    'correct_label': str(item.get('correct_label','')).strip().upper()[:2],
+                                    'expected_answer': str(item.get('expected_answer','')).strip()[:5000],
+                                    'explanation': str(item.get('explanation','')).strip()[:5000]})
+                if not preview:
+                    raise RuntimeError('A IA não identificou questões válidas. Tente o importador tradicional ou revise o PDF.')
+                return render_template('ai_preview.html', items=preview, mode='import', subject=subject,
+                                       subject_code=subject_code, difficulty=difficulty, source=source,
+                                       used_ocr=used_ocr, back_url=url_for('import_questions'))
+            except Exception as ai_exc:
+                app.logger.exception('Falha no processamento IA do PDF')
+                flash('O processamento por IA falhou: ' + str(ai_exc)[:240] + ' O importador tradicional continua disponível.', 'error')
+                return render_template('import_questions.html')
         # Answer keys like "1-A 2-C", "1. A", or one answer per line.
         answer_text = (answer_text or '') + '\n' + full_text
         answers = {}
@@ -315,15 +411,14 @@ def import_questions():
             qnum = int(start.group(1))
             end = starts[idx+1].start() if idx+1 < len(starts) else len(body)
             chunk = body[start.end():end].strip()
-            # Detect multiple-choice options labelled A) / A. / (A)
-            option_matches = list(re.finditer(r'(?im)(?:^|\n)\s*(?:\(([A-E])\)|([A-E])[\)\.])\s+', chunk))
+            # O tipo vem da escolha explícita no formulário, não da inferência do parser.
+            option_matches = list(re.finditer(r'(?im)(?:^|\n)\s*(?:\(([A-E])\)|([A-E])[\)\.])\s+', chunk)) if selected_type == 'multiple_choice' else []
             statement = chunk[:option_matches[0].start()].strip() if option_matches else chunk
             choices = []
             for oi, om in enumerate(option_matches):
                 label = (om.group(1) or om.group(2)).upper()
                 cend = option_matches[oi+1].start() if oi+1 < len(option_matches) else len(chunk)
                 ctext = chunk[om.end():cend].strip()
-                # Avoid empty alternatives and common page/header noise.
                 if ctext:
                     choices.append((label, ctext))
             statement = re.sub(r'\s+', ' ', statement).strip()
@@ -333,38 +428,184 @@ def import_questions():
                 continue
             seen.add(norm)
             valid_choices = len(choices) >= 2 and len(choices) <= 5
-            correct_label = answers.get(qnum)
+            # Não cria questão objetiva sem alternativas: evita quebrar simulados.
+            if selected_type == 'multiple_choice' and not valid_choices:
+                duplicates += 1
+                continue
+            correct_label = answers.get(qnum) if selected_type == 'multiple_choice' else None
             labels = [c[0] for c in choices]
-            status = 'Revisada'
-            if used_ocr or len(statement) < 35 or not valid_choices or not correct_label or correct_label not in labels:
-                status = 'Não revisada'
+            question_type = selected_type
+            status = 'Não revisada' if (used_ocr or len(statement) < 35 or (selected_type == 'multiple_choice' and (not correct_label or correct_label not in labels))) else 'Revisada'
             q = Question(statement=statement, subject=subject, subject_code=subject_code,
                          difficulty=difficulty, source=source, created_by=current_user.id,
-                         review_status=status,
-                         explanation='Importada automaticamente do PDF. Confira o enunciado e o gabarito.' if status == 'Não revisada' else None)
+                         review_status=status, question_type=question_type,
+                         expected_answer=None,
+                         explanation='Importada automaticamente do PDF. Confira o enunciado, as alternativas e o gabarito.' if status == 'Não revisada' else None)
             db.session.add(q); db.session.flush()
-            if valid_choices:
+            if selected_type == 'multiple_choice':
                 for pos, (label, ctext) in enumerate(choices):
                     db.session.add(Choice(question_id=q.id, text=ctext,
                                           is_correct=(correct_label is not None and label == correct_label),
                                           position=pos))
-            else:
-                # Keep the question in the bank even when alternatives could not be parsed.
-                db.session.add(Choice(question_id=q.id, text='Alternativa não identificada automaticamente — revisar PDF original.', is_correct=False, position=0))
-                db.session.add(Choice(question_id=q.id, text='Alternativa não identificada automaticamente — revisar PDF original.', is_correct=False, position=1))
             imported += 1
             if status == 'Não revisada': uncertain += 1
         db.session.commit()
-        flash(f'Importação concluída: {imported} questão(ões) adicionada(s), {uncertain} marcada(s) como “Não revisada” e {duplicates} ignorada(s) por possível duplicidade/extração inválida.', 'success')
+        skipped_note = ' ignorada(s) por duplicidade, extração inválida ou falta de alternativas (em múltipla escolha).'
+        flash(f'Importação concluída: {imported} questão(ões) adicionada(s), {uncertain} marcada(s) como “Não revisada” e {duplicates}' + skipped_note, 'success')
         return redirect(url_for('questions', review='Não revisada'))
     return render_template('import_questions.html')
+
+@app.route('/questions/ai/import/approve', methods=['POST'])
+@login_required
+def approve_ai_import():
+    try:
+        items = json.loads(request.form.get('items_json', '[]'))
+    except (ValueError, TypeError):
+        abort(400)
+    subject = (request.form.get('subject') or '').strip()[:100]
+    subject_code = (request.form.get('subject_code') or '').strip().upper()
+    difficulty = request.form.get('difficulty', 'Média')
+    source = (request.form.get('source') or 'PDF importado').strip()[:200]
+    if not subject or not re.fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code) or difficulty not in ('Fácil','Média','Difícil') or not isinstance(items, list) or not items or len(items) > 100:
+        abort(400)
+    saved = 0
+    for item in items:
+        if not isinstance(item, dict): continue
+        statement = str(item.get('statement', '')).strip()[:10000]
+        qtype = item.get('question_type')
+        if len(statement) < 10 or qtype not in ('multiple_choice','essay'): continue
+        choices = item.get('choices', []) if qtype == 'multiple_choice' else []
+        correct_label = str(item.get('correct_label','')).strip().upper()
+        labels = [str(c.get('label','')).strip().upper() for c in choices if isinstance(c,dict)]
+        if qtype == 'multiple_choice' and (len(choices) < 2 or len(choices) > 5): continue
+        has_key = qtype == 'multiple_choice' and correct_label in labels
+        status = 'Revisada' if has_key or (qtype == 'essay' and bool(str(item.get('expected_answer','')).strip())) else 'Não revisada'
+        q = Question(statement=statement, subject=subject, subject_code=subject_code, difficulty=difficulty,
+                     source=source, created_by=current_user.id, review_status=status, question_type=qtype,
+                     expected_answer=(str(item.get('expected_answer','')).strip() or None) if qtype == 'essay' else None,
+                     explanation=(str(item.get('explanation','')).strip() or 'Texto organizado com auxílio de IA; confira antes de usar.')[:5000])
+        db.session.add(q); db.session.flush()
+        if qtype == 'multiple_choice':
+            for pos, choice in enumerate(choices):
+                if not isinstance(choice,dict) or not str(choice.get('text','')).strip(): continue
+                label = str(choice.get('label','')).strip().upper()
+                db.session.add(Choice(question_id=q.id, text=str(choice.get('text','')).strip()[:3000], is_correct=bool(has_key and label == correct_label), position=pos))
+        saved += 1
+    db.session.commit()
+    flash(f'Prévia aprovada: {saved} questão(ões) salva(s). Confira os itens marcados como “Não revisada”.', 'success')
+    return redirect(url_for('questions', subject=subject))
+
+@app.route('/questions/<int:question_id>/ai-correct', methods=['POST'])
+@login_required
+def ai_correct_question(question_id):
+    q = db.session.get(Question, question_id) or abort(404)
+    answer = (request.form.get('answer_text') or '').strip()[:12000]
+    choice_id = request.form.get('choice_id', '').strip()
+    if choice_id:
+        try: selected = Choice.query.filter_by(id=int(choice_id), question_id=q.id).first_or_404()
+        except ValueError: abort(400)
+        answer = selected.text
+    if not answer:
+        flash('Envie sua resposta antes de pedir a correção por IA.', 'error')
+        return redirect(url_for('question_detail', question_id=q.id))
+    if q.question_type == 'multiple_choice' and any(c.is_correct for c in q.choices):
+        flash('Esta questão já possui gabarito cadastrado; use a correção normal.', 'info')
+        return redirect(url_for('question_detail', question_id=q.id))
+    try:
+        choices_text = '\n'.join(f'{chr(65+i)}. {c.text}' for i,c in enumerate(q.choices))
+        result = openai_json(
+            'Você é um avaliador educacional cuidadoso. Avalie a resposta do estudante com base no enunciado e em conhecimento confiável. Se faltar contexto, avise. Não finja que existe gabarito oficial. Dê feedback formativo, não apenas certo/errado.',
+            f'Enunciado: {q.statement}\nAlternativas (se houver):\n{choices_text}\nResposta de referência cadastrada (se houver): {q.expected_answer or "nenhuma"}\nExplicação existente: {q.explanation or "nenhuma"}\nResposta do estudante: {answer}\nMatéria: {q.subject}',
+            'questhub_ai_feedback', FEEDBACK_SCHEMA)
+        return render_template('ai_feedback.html', q=q, answer=answer, result=result)
+    except Exception as exc:
+        app.logger.exception('Falha na correção por IA')
+        flash('Não foi possível corrigir com IA agora: ' + str(exc)[:220], 'error')
+        return redirect(url_for('question_detail', question_id=q.id))
+
+@app.route('/subjects/<path:subject>/ai-create', methods=['GET','POST'])
+@login_required
+def create_ai_questions(subject):
+    subject = subject.strip()[:100]
+    existing = Question.query.filter(Question.subject == subject).count()
+    if existing <= 10:
+        flash('A criação com IA aparece quando o assunto tem mais de 10 questões cadastradas.', 'info')
+        return redirect(url_for('questions', subject=subject))
+    sample = Question.query.filter(Question.subject == subject).order_by(Question.created_at.desc()).limit(15).all()
+    if request.method == 'POST':
+        try: amount = max(1, min(10, int(request.form.get('amount', '5'))))
+        except ValueError: amount = 5
+        kind = request.form.get('question_type', 'multiple_choice')
+        if kind not in ('multiple_choice','essay'): kind = 'multiple_choice'
+        context = '\n\n'.join([f'Questão existente: {q.statement}\nAlternativas: ' + '; '.join(c.text for c in q.choices) for q in sample])
+        try:
+            parsed = openai_json(
+                'Crie questões educacionais originais em português, alinhadas ao assunto e ao nível inferido dos exemplos. Não copie literalmente os exemplos. Para múltipla escolha, crie 4 alternativas e um único gabarito correto. Para discursivas, não inclua alternativas. Explicações devem ser concisas. Retorne apenas o schema.',
+                f'Assunto: {subject}. Tipo: {kind}. Quantidade: {amount}. Exemplos de questões já existentes para orientar escopo e dificuldade:\n{context[:18000]}',
+                'questhub_generated_questions', QUESTION_SCHEMA)
+            items=[]
+            for item in parsed.get('questions',[])[:amount]:
+                statement=str(item.get('statement','')).strip()[:10000]
+                qtype=kind
+                choices=item.get('choices',[]) if kind=='multiple_choice' else []
+                if len(statement)<10: continue
+                if kind=='multiple_choice':
+                    choices=[{'label':str(c.get('label',''))[:2].upper(), 'text':str(c.get('text','')).strip()[:3000]} for c in choices[:5] if str(c.get('text','')).strip()]
+                    if len(choices)<2: continue
+                items.append({'number':len(items)+1,'statement':statement,'question_type':qtype,'choices':choices,
+                              'correct_label':str(item.get('correct_label','')).strip().upper()[:2],
+                              'expected_answer':str(item.get('expected_answer','')).strip()[:5000],
+                              'explanation':str(item.get('explanation','')).strip()[:5000]})
+            if not items: raise RuntimeError('A IA não retornou questões válidas. Tente novamente.')
+            return render_template('ai_preview.html', items=items, mode='generated', subject=subject,
+                                   subject_code=(sample[0].subject_code or 'IA001'), difficulty=(sample[0].difficulty or 'Média'),
+                                   source='Elaborada por IA', back_url=url_for('questions', subject=subject))
+        except Exception as exc:
+            app.logger.exception('Falha ao criar questões por IA')
+            flash('Não foi possível criar questões com IA: ' + str(exc)[:240], 'error')
+    return render_template('ai_create.html', subject=subject, existing=existing)
+
+@app.route('/questions/ai/generated/approve', methods=['POST'])
+@login_required
+def approve_ai_generated():
+    try: items=json.loads(request.form.get('items_json','[]'))
+    except (ValueError, TypeError): abort(400)
+    subject=(request.form.get('subject') or '').strip()[:100]
+    subject_code=(request.form.get('subject_code') or 'IA001').strip().upper()
+    difficulty=request.form.get('difficulty','Média')
+    if not subject or not re.fullmatch(r'[A-Z]{2,5}[0-9]{3}',subject_code) or difficulty not in ('Fácil','Média','Difícil') or not isinstance(items,list) or not items or len(items)>10: abort(400)
+    saved=0
+    for item in items:
+        statement=str(item.get('statement','')).strip()[:10000] if isinstance(item,dict) else ''
+        qtype=item.get('question_type') if isinstance(item,dict) else None
+        if len(statement)<10 or qtype not in ('multiple_choice','essay'): continue
+        choices=item.get('choices',[]) if qtype=='multiple_choice' else []
+        correct_label=str(item.get('correct_label','')).strip().upper()
+        labels=[str(c.get('label','')).strip().upper() for c in choices if isinstance(c,dict)]
+        if qtype=='multiple_choice' and (len(choices)<2 or len(choices)>5): continue
+        has_key=qtype=='multiple_choice' and correct_label in labels
+        q=Question(statement=statement,subject=subject,subject_code=subject_code,difficulty=difficulty,source='Elaborada por IA',
+                   created_by=current_user.id,review_status='Não revisada',question_type=qtype,ai_generated=True,
+                   expected_answer=(str(item.get('expected_answer','')).strip() or None) if qtype=='essay' else None,
+                   explanation=(str(item.get('explanation','')).strip() or None))
+        db.session.add(q); db.session.flush()
+        for pos,c in enumerate(choices if qtype=='multiple_choice' else []):
+            if not isinstance(c,dict) or not str(c.get('text','')).strip(): continue
+            label=str(c.get('label','')).strip().upper()
+            db.session.add(Choice(question_id=q.id,text=str(c.get('text','')).strip()[:3000],is_correct=bool(has_key and label==correct_label),position=pos))
+        saved+=1
+    db.session.commit()
+    flash(f'{saved} questão(ões) elaborada(s) por IA foram salvas com a tag “Elaborada por IA” e marcadas para revisão.', 'success')
+    return redirect(url_for('questions', subject=subject))
 
 @app.route('/questions')
 def questions():
     query = filtered_questions(Question.query)
     qs = query.order_by(Question.created_at.desc()).all()
     statuses = {q.id: recent_status(current_user.id, q.id) for q in qs} if current_user.is_authenticated else {}
-    return render_template('questions.html', questions=qs, opts=question_options(), statuses=statuses)
+    selected_subject = request.args.get('subject', '').strip()
+    selected_subject_count = Question.query.filter_by(subject=selected_subject).count() if selected_subject else 0
+    return render_template('questions.html', questions=qs, opts=question_options(), statuses=statuses, selected_subject=selected_subject, selected_subject_count=selected_subject_count)
 
 @app.route('/questions/new', methods=['GET','POST'])
 @login_required
@@ -374,18 +615,25 @@ def new_question():
         subject_code = request.form.get('subject_code','').strip().upper()
         difficulty = request.form.get('difficulty','').strip(); source = request.form.get('source','').strip() or 'Não informada'
         explanation = request.form.get('explanation','').strip()
+        question_type = request.form.get('question_type','multiple_choice')
+        expected_answer = request.form.get('expected_answer','').strip()
         texts = [t.strip() for t in request.form.getlist('choice_text[]') if t.strip()]
         correct_index = request.form.get('correct_index','')
-        if len(statement) < 5 or not subject or not subject_code or not __import__('re').fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code) or difficulty not in ('Fácil','Média','Difícil') or len(texts) < 2:
-            flash('Informe enunciado, assunto, código no formato FIS003, dificuldade e pelo menos duas alternativas.', 'error')
-        elif not correct_index.isdigit() or int(correct_index) >= len(texts):
-            flash('Selecione a alternativa correta.', 'error')
+        valid_base = len(statement) >= 5 and bool(subject) and bool(subject_code) and bool(__import__('re').fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code)) and difficulty in ('Fácil','Média','Difícil')
+        if not valid_base or question_type not in ('multiple_choice','essay'):
+            flash('Informe enunciado, assunto, código FIS003 válido e dificuldade.', 'error')
+        elif question_type == 'multiple_choice' and (len(texts) < 2 or not correct_index.isdigit() or int(correct_index) >= len(texts)):
+            flash('Questões de múltipla escolha precisam de pelo menos duas alternativas e um gabarito.', 'error')
         else:
-            q = Question(statement=statement, subject=subject, subject_code=subject_code, difficulty=difficulty, source=source, explanation=explanation or None, created_by=current_user.id)
+            q = Question(statement=statement, subject=subject, subject_code=subject_code, difficulty=difficulty, source=source,
+                         explanation=explanation or None, created_by=current_user.id, question_type=question_type,
+                         expected_answer=(expected_answer or None) if question_type == 'essay' else None)
             db.session.add(q); db.session.flush()
-            correct = int(correct_index)
-            for i, text in enumerate(texts): db.session.add(Choice(question_id=q.id, text=text, is_correct=(i==correct), position=i))
-            db.session.commit(); flash('Questão adicionada ao banco!', 'success'); return redirect(url_for('question_detail', question_id=q.id))
+            if question_type == 'multiple_choice':
+                correct = int(correct_index)
+                for i, choice_text in enumerate(texts): db.session.add(Choice(question_id=q.id, text=choice_text, is_correct=(i==correct), position=i))
+            db.session.commit(); flash('Questão dissertativa adicionada!' if question_type == 'essay' else 'Questão adicionada ao banco!', 'success')
+            return redirect(url_for('question_detail', question_id=q.id))
     return render_template('question_new.html')
 
 @app.route('/questions/<int:question_id>')
@@ -398,12 +646,22 @@ def question_detail(question_id):
 @login_required
 def answer_question(question_id):
     q = db.session.get(Question, question_id) or abort(404)
+    if q.question_type == 'essay':
+        answer_text = request.form.get('answer_text', '').strip()
+        if len(answer_text) < 1:
+            flash('Escreva sua resposta antes de enviar.', 'error')
+            return redirect(url_for('question_detail', question_id=q.id))
+        db.session.add(EssayResponse(user_id=current_user.id, question_id=q.id, answer_text=answer_text))
+        db.session.commit()
+        return render_template('answer_result.html', q=q, choice=None, correct=None, essay_answer=answer_text, ai_available=not bool(q.expected_answer))
     try: choice_id = int(request.form.get('choice_id',''))
     except ValueError: abort(400)
     choice = Choice.query.filter_by(id=choice_id, question_id=q.id).first_or_404()
-    attempt = Attempt(user_id=current_user.id, question_id=q.id, choice_id=choice.id, is_correct=choice.is_correct, mode='study')
-    db.session.add(attempt); db.session.commit()
-    return render_template('answer_result.html', q=q, choice=choice, correct=choice.is_correct)
+    has_answer_key = any(c.is_correct for c in q.choices)
+    if has_answer_key:
+        attempt = Attempt(user_id=current_user.id, question_id=q.id, choice_id=choice.id, is_correct=choice.is_correct, mode='study')
+        db.session.add(attempt); db.session.commit()
+    return render_template('answer_result.html', q=q, choice=choice, correct=(choice.is_correct if has_answer_key else None), essay_answer=None, ai_available=not has_answer_key)
 
 
 @app.route('/subjects')
@@ -469,7 +727,7 @@ def leaderboard():
     users = User.query.order_by(User.username).all(); rows=[]
     for user in users:
         attempts = Attempt.query.filter_by(user_id=user.id).all()
-        total = len(attempts); correct = sum(a.is_correct for a in attempts)
+        total = len(attempts); correct = sum(a.is_correct is True for a in attempts)
         rows.append({'username':user.username, 'total':total, 'correct':correct, 'pct':round(correct*100/total,1) if total else 0})
     rows.sort(key=lambda r:(r['pct'] if r['total'] else -1, r['total']), reverse=True)
     return render_template('leaderboard.html', rows=rows)
@@ -507,10 +765,17 @@ def take_exam(exam_id):
         answers={}
         if request.method=='POST' and remaining>0:
             for q in qs:
-                val=request.form.get(f'q_{q.id}')
-                if val and val.isdigit() and any(c.id==int(val) for c in q.choices): answers[str(q.id)]=int(val)
+                val=request.form.get(f'q_{q.id}', '').strip()
+                if q.question_type == 'essay':
+                    if val:
+                        answers[str(q.id)] = val
+                        db.session.add(EssayResponse(user_id=current_user.id, question_id=q.id, answer_text=val))
+                elif val.isdigit() and any(c.id==int(val) for c in q.choices):
+                    answers[str(q.id)]=int(val)
         score=0
         for q in qs:
+            if q.question_type == 'essay':
+                continue
             cid=answers.get(str(q.id)); choice=next((c for c in q.choices if c.id==cid),None)
             if choice:
                 db.session.add(Attempt(user_id=current_user.id,question_id=q.id,choice_id=choice.id,is_correct=choice.is_correct,mode='exam'))
@@ -526,10 +791,43 @@ def exam_result(exam_id):
     if not exam.finished_at: return redirect(url_for('take_exam',exam_id=exam.id))
     answers=json.loads(exam.answers_json or '{}'); qs=[db.session.get(Question,qid) for qid in json.loads(exam.question_ids)]; qs=[q for q in qs if q]
     details=[]
+    graded_total=sum(1 for q in qs if q.question_type != 'essay')
     for q in qs:
-        cid=answers.get(str(q.id)); chosen=next((c for c in q.choices if c.id==cid),None); correct=next((c for c in q.choices if c.is_correct),None)
-        details.append({'q':q,'chosen':chosen,'correct':correct,'ok':bool(chosen and chosen.is_correct)})
-    return render_template('exam_result.html', exam=exam, details=details, total=len(qs), pct=round((exam.score or 0)*100/len(qs),1) if qs else 0)
+        answer=answers.get(str(q.id))
+        if q.question_type == 'essay':
+            details.append({'q':q,'chosen':None,'answer_text':answer if isinstance(answer,str) else None,'correct':None,'ok':None,'manual':True})
+        else:
+            cid=answer if isinstance(answer,int) else None
+            chosen=next((c for c in q.choices if c.id==cid),None); correct=next((c for c in q.choices if c.is_correct),None)
+            details.append({'q':q,'chosen':chosen,'answer_text':None,'correct':correct,'ok':bool(chosen and chosen.is_correct),'manual':False})
+    return render_template('exam_result.html', exam=exam, details=details, total=len(qs), graded_total=graded_total, pct=round((exam.score or 0)*100/graded_total,1) if graded_total else 0)
+
+@app.route('/admin/questions/<int:question_id>/delete', methods=['POST'])
+@login_required
+def admin_delete_question(question_id):
+    if not backup_admin_required(): abort(403)
+    q = db.session.get(Question, question_id) or abort(404)
+    Attempt.query.filter_by(question_id=q.id).delete(synchronize_session=False)
+    EssayResponse.query.filter_by(question_id=q.id).delete(synchronize_session=False)
+    db.session.delete(q)
+    db.session.commit()
+    flash(f'Questão #{question_id} excluída.', 'success')
+    return redirect(url_for('questions'))
+
+@app.route('/admin/database/reset', methods=['POST'])
+@login_required
+def admin_reset_database():
+    if not backup_admin_required(): abort(403)
+    confirmation = request.form.get('confirmation', '').strip()
+    if confirmation != 'RESETAR':
+        flash('Reset cancelado: digite RESETAR exatamente para confirmar.', 'error')
+        return redirect(url_for('backups_page'))
+    # Preserve user accounts and the configured admin login, but erase study content/progress.
+    with db.engine.begin() as conn:
+        for model in (EssayResponse, Attempt, ExamSession, Choice, Question, StudyMaterial, SubjectCode):
+            conn.execute(model.__table__.delete())
+    flash('Banco de estudos resetado. Contas de usuário foram preservadas; questões, materiais e progresso foram apagados.', 'success')
+    return redirect(url_for('backups_page'))
 
 @app.route('/admin/backups', methods=['GET'])
 @login_required
@@ -647,8 +945,14 @@ with app.app_context():
         inspector = inspect(db.engine)
         if 'question' in inspector.get_table_names():
             cols = {c['name'] for c in inspector.get_columns('question')}
-            if 'review_status' not in cols:
-                with db.engine.begin() as conn:
+            with db.engine.begin() as conn:
+                if 'review_status' not in cols:
                     conn.execute(text("ALTER TABLE question ADD COLUMN review_status VARCHAR(30) NOT NULL DEFAULT 'Revisada'"))
+                if 'question_type' not in cols:
+                    conn.execute(text("ALTER TABLE question ADD COLUMN question_type VARCHAR(24) NOT NULL DEFAULT 'multiple_choice'"))
+                if 'expected_answer' not in cols:
+                    conn.execute(text('ALTER TABLE question ADD COLUMN expected_answer TEXT'))
+                if 'ai_generated' not in cols:
+                    conn.execute(text('ALTER TABLE question ADD COLUMN ai_generated BOOLEAN NOT NULL DEFAULT FALSE'))
     except Exception as migration_error:
         app.logger.warning("Question review-status migration will retry on next startup: %s", migration_error)
