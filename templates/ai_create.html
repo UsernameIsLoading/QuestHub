@@ -1,0 +1,6 @@
+{% extends 'base.html' %}
+{% block title %}Criar questões com IA — QuestHub{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">FERRAMENTAS DE ESTUDO</div><h1>Criar questões com IA<span class="heading-dot">.</span></h1><p>Assunto: {{ subject }} · {{ existing }} questões existentes</p></div><a class="button secondary" href="{{ url_for('questions', subject=subject) }}">← Voltar ao assunto</a></div>
+<div class="panel form-panel"><div class="flash info">A IA usa questões existentes como referência de conteúdo e dificuldade, mas deve criar enunciados novos. Todas as questões serão exibidas numa prévia e só serão salvas depois da sua aprovação.</div><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><div class="form-grid"><label>Quantidade<select class="input" name="amount"><option value="3">3 questões</option><option value="5" selected>5 questões</option><option value="10">10 questões</option></select></label><label>Tipo<select class="input" name="question_type"><option value="multiple_choice">Múltipla escolha</option><option value="essay">Discursivas</option></select></label></div><div class="form-actions"><a class="clear-link" href="{{ url_for('questions', subject=subject) }}">Cancelar</a><button class="button primary" type="submit">Gerar prévia →</button></div></form></div>
+{% endblock %}

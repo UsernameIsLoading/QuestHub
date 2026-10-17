@@ -1,0 +1,8 @@
+{% extends 'base.html' %}
+{% block title %}Correção por IA — QuestHub{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">FEEDBACK OPCIONAL</div><h1>Correção por IA<span class="heading-dot">.</span></h1><p>Questão {{ q.id }} · {{ q.subject }}</p></div><a class="button secondary" href="{{ url_for('question_detail', question_id=q.id) }}">← Voltar à questão</a></div>
+<div class="flash info"><strong>Importante:</strong> esta é uma avaliação sugerida por IA, não um gabarito oficial. Ela pode cometer erros; confira com materiais confiáveis.</div>
+<article class="panel result-panel"><h2>{{ q.statement }}</h2><div class="essay-submission"><small>SUA RESPOSTA</small><p>{{ answer }}</p></div><div class="tag-row"><span class="tag">Confiança declarada: {{ result.confidence }}</span></div><section class="explanation"><h3>Resposta sugerida</h3><p>{{ result.suggested_answer }}</p></section><section class="explanation"><h3>Avaliação da sua resposta</h3><p>{{ result.assessment }}</p></section><section class="explanation"><h3>Explicação</h3><p>{{ result.explanation }}</p></section></article>
+<div class="hero-actions centered"><a class="button primary" href="{{ url_for('question_detail', question_id=q.id) }}">Voltar à questão</a><a class="button secondary" href="{{ url_for('questions') }}">Banco de questões</a></div>
+{% endblock %}

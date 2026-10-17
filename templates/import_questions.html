@@ -1,20 +1,22 @@
 {% extends "base.html" %}
 {% block title %}Importar questões — QuestHub{% endblock %}
 {% block content %}
-<section class="panel" style="max-width:850px;margin:2rem auto;">
-<h1>Importar questões em lote</h1>
-<p>Envie um PDF com questões numeradas e cole o gabarito. Itens ambíguos recebem a marca <strong>Não revisada</strong>.</p>
-<div class="flash info">PDFs digitais são lidos diretamente. PDFs escaneados passam por OCR automático (português e inglês); questões lidas por OCR ficam como <strong>Não revisada</strong> para conferência.</div>
-<form method="post" enctype="multipart/form-data">
-<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-<label for="pdf_file">PDF das questões</label><input id="pdf_file" name="pdf_file" type="file" accept="application/pdf,.pdf" required>
-<label for="answer_key">Gabarito (ex.: 1-A, 2-C, 3-B)</label><textarea id="answer_key" name="answer_key" rows="5" placeholder="1-A&#10;2-C&#10;3-B"></textarea>
-<label for="subject">Matéria/assunto</label><input id="subject" name="subject" maxlength="100" value="Questões importadas" required>
-<label for="subject_code">Código da matéria</label><input id="subject_code" name="subject_code" maxlength="8" value="IMP001" pattern="[A-Za-z]{2,5}[0-9]{3}" required>
-<label for="difficulty">Dificuldade padrão</label><select id="difficulty" name="difficulty"><option>Média</option><option>Fácil</option><option>Difícil</option></select>
-<label for="source">Fonte (nome da prova/arquivo)</label><input id="source" name="source" maxlength="200" value="PDF importado">
-<button type="submit">Importar questões</button>
-</form>
-<p><strong>Importante:</strong> confira “Não revisada” antes de usar em simulados. O OCR depende da qualidade da imagem e pode confundir letras, números e alternativas. A importação não apaga questões existentes.</p>
-</section>
+<div class="page-heading import-heading"><div><div class="eyebrow">BANCO DE QUESTÕES</div><h1>Importar questões<span class="heading-dot">.</span></h1><p>Adicione várias questões a partir de um PDF digital ou escaneado.</p></div><a class="button secondary" href="{{ url_for('questions') }}">← Voltar ao banco</a></div>
+<div class="import-layout">
+  <section class="panel import-form-panel">
+    <div class="section-kicker"><span class="kicker-icon">⇧</span><div><h2>Arquivo e configuração</h2><p>Preencha os dados e envie o documento.</p></div></div>
+    <div class="flash info import-notice"><strong>OCR automático:</strong> o QuestHub tenta extrair texto digital primeiro. Se a página for escaneada, usa Tesseract OCR em português/inglês. Questões reconhecidas por OCR ficam como <strong>Não revisada</strong>.</div>
+    <form method="post" enctype="multipart/form-data" class="import-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="pdf_file">PDF das questões <span class="required-mark">*</span><input id="pdf_file" name="pdf_file" type="file" accept="application/pdf,.pdf" required></label>
+      <label for="question_type">Tipo das questões neste PDF <span class="required-mark">*</span><select id="question_type" name="question_type" required><option value="multiple_choice" selected>Múltipla escolha (com alternativas)</option><option value="essay">Discursivas (resposta escrita)</option></select><small>Escolha o tipo predominante do arquivo. O importador não tentará converter questões discursivas em alternativas nem o contrário.</small></label>
+      <label class="ai-import-toggle"><input type="checkbox" name="ai_process" value="yes"> Organizar com IA e revisar uma prévia antes de salvar <small>Usa a OPENAI_API_KEY configurada no servidor. Nada será salvo até você aprovar a prévia.</small></label>
+      <label for="answer_key">Gabarito das alternativas <span class="muted">(opcional; usado em múltipla escolha)</span><textarea id="answer_key" name="answer_key" rows="4" placeholder="Ex.: 1-A, 2-C, 3-B — pode deixar vazio"></textarea><small>Se o gabarito estiver no próprio PDF, o importador tentará identificá-lo. Questões discursivas não recebem correção automática.</small></label>
+      <div class="import-field-grid"><label for="subject">Matéria/assunto<input id="subject" name="subject" maxlength="100" value="Questões importadas" required></label><label for="subject_code">Código da matéria<input id="subject_code" name="subject_code" maxlength="8" value="IMP001" pattern="[A-Za-z]{2,5}[0-9]{3}" required><small>2–5 letras e 3 números.</small></label></div>
+      <div class="import-field-grid"><label for="difficulty">Dificuldade padrão<select id="difficulty" name="difficulty"><option>Média</option><option>Fácil</option><option>Difícil</option></select></label><label for="source">Fonte<input id="source" name="source" maxlength="200" value="PDF importado" placeholder="Nome da prova ou arquivo"></label></div>
+      <div class="import-actions"><a class="clear-link" href="{{ url_for('questions') }}">Cancelar</a><button class="button primary" type="submit">Importar questões →</button></div>
+    </form>
+  </section>
+  <aside class="panel import-help-panel"><div class="help-mark">✦</div><h2>Como funciona</h2><ol><li><strong>Leitura</strong><span>Texto digital é extraído diretamente; páginas escaneadas passam por OCR.</span></li><li><strong>Separação</strong><span>Você escolhe se o PDF contém questões de múltipla escolha ou discursivas; o sistema separa os enunciados conforme o tipo escolhido.</span></li><li><strong>Revisão</strong><span>Itens ambíguos ficam marcados para conferência antes de usar em provas.</span></li></ol><div class="notice import-caution"><strong>Importante</strong><p>OCR pode confundir letras, números e fórmulas. A importação não apaga questões existentes e não inventa um gabarito quando não consegue identificá-lo.</p></div></aside>
+</div>
 {% endblock %}

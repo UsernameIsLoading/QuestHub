@@ -19,7 +19,7 @@
       <a href="{{ url_for('exam_setup') }}">Modo prova</a>
       <a href="{{ url_for('leaderboard') }}">Ranking</a>
       {% if current_user.is_authenticated %}
-        {% if current_user.username|lower == config.get('BACKUP_ADMIN_USERNAME', '')|lower and config.get('BACKUP_ADMIN_USERNAME') %}<a href="{{ url_for('backups_page') }}">Backups</a>{% endif %}
+        {% if current_user.username|lower == config.get('BACKUP_ADMIN_USERNAME', '')|lower and config.get('BACKUP_ADMIN_USERNAME') %}<a href="{{ url_for('backups_page') }}">Admin / Backups</a>{% endif %}
         <a href="{{ url_for('dashboard') }}">Meu painel</a>
         <form method="post" action="{{ url_for('logout') }}" class="nav-inline-form"><button class="nav-cta" type="submit">Sair</button></form>
       {% else %}
