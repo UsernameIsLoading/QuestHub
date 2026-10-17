@@ -72,7 +72,7 @@ Usuários autenticados podem abrir **Códigos** na navegação e cadastrar novos
 Para ativar a organização de PDFs por IA, correção opcional de questões sem gabarito e geração de novas questões:
 
 1. Adicione `GEMINI_API_KEY` nas variáveis de ambiente do serviço no Render. Nunca coloque a chave no HTML, JavaScript ou em um repositório público.
-2. Opcionalmente configure `GEMINI_MODEL` (padrão: `gemini-2.5-flash`).
+2. Opcionalmente configure `GEMINI_MODEL` (padrão: `gemini-3.8-flash`).
 3. Faça um novo deploy para instalar a dependência `google-genai` declarada em `requirements.txt`.
 4. Comece pelo nível gratuito disponível no Google AI Studio, sujeito a limites e disponibilidade do modelo. Confira as condições de privacidade: no nível gratuito, conteúdo enviado pode ser usado para melhorar os produtos do Google. Não envie dados pessoais ou sensíveis nos PDFs. Se mudar para um nível pago, confira os preços antes de ativá-lo.
 

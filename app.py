@@ -189,7 +189,7 @@ def gemini_json(system_prompt, user_prompt, schema_name, schema):
     from google.genai import types
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash'),
+        model=os.environ.get('GEMINI_MODEL', 'gemini-3.8-flash'),
         contents=f'{system_prompt}\n\n{user_prompt}',
         config=types.GenerateContentConfig(
             response_mime_type='application/json',
