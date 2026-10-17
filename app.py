@@ -52,6 +52,9 @@ class Question(db.Model):
     explanation = db.Column(db.Text)
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    review_status = db.Column(db.String(30), nullable=False, default='Revisada', index=True)
+    question_type = db.Column(db.String(24), nullable=False, default='multiple_choice', index=True)
+    expected_answer = db.Column(db.Text)
     choices = db.relationship('Choice', backref='question', cascade='all, delete-orphan', order_by='Choice.position')
 
 class SubjectCode(db.Model):
@@ -93,6 +96,14 @@ class Attempt(db.Model):
     mode = db.Column(db.String(10), nullable=False, default='study')
     question = db.relationship('Question')
     choice = db.relationship('Choice')
+
+class EssayResponse(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    question_id = db.Column(db.Integer, db.ForeignKey('question.id'), nullable=False, index=True)
+    answer_text = db.Column(db.Text, nullable=False)
+    submitted_at = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    question = db.relationship('Question')
 
 class ExamSession(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -152,11 +163,13 @@ def filtered_questions(query):
     subject = request.args.get('subject', '').strip()
     difficulty = request.args.get('difficulty', '').strip()
     source = request.args.get('source', '').strip()
+    review = request.args.get('review', '').strip()
     code = request.args.get('code', '').strip().upper()
     if code: query = query.filter(Question.subject_code.ilike(f'%{code}%'))
     if subject: query = query.filter(Question.subject == subject)
     if difficulty in ('Fácil', 'Média', 'Difícil'): query = query.filter(Question.difficulty == difficulty)
     if source: query = query.filter(Question.source == source)
+    if review in ('Revisada', 'Não revisada'): query = query.filter(Question.review_status == review)
     return query
 
 def question_options():
@@ -211,13 +224,13 @@ def logout(): logout_user(); flash('Você saiu da conta.', 'info'); return redir
 @login_required
 def dashboard():
     attempts = Attempt.query.filter_by(user_id=current_user.id).all()
-    total = len(attempts); correct = sum(a.is_correct for a in attempts)
+    total = len(attempts); correct = sum(a.is_correct is True for a in attempts)
     unique_answered = len({a.question_id for a in attempts})
     by_subject = {}
     for a in attempts:
         key = a.question.subject
         by_subject.setdefault(key, {'total': 0, 'correct': 0})
-        by_subject[key]['total'] += 1; by_subject[key]['correct'] += int(a.is_correct)
+        by_subject[key]['total'] += 1; by_subject[key]['correct'] += int(a.is_correct is True)
     due = []
     latest = {}
     for a in sorted(attempts, key=lambda x: x.answered_at): latest[a.question_id] = a
@@ -228,6 +241,184 @@ def dashboard():
             q = db.session.get(Question, qid)
             if q: due.append(q)
     return render_template('dashboard.html', total=total, correct=correct, pct=round(correct*100/total,1) if total else 0, unique_answered=unique_answered, by_subject=by_subject, due=due[:8])
+
+
+@app.route('/questions/import', methods=['GET', 'POST'])
+@login_required
+def import_questions():
+    """Bulk-import questions from a text-based PDF and a separate/pasted answer key."""
+    import re
+    from werkzeug.utils import secure_filename
+    if request.method == 'POST':
+        pdf = request.files.get('pdf_file')
+        subject = (request.form.get('subject') or 'Questões importadas').strip()[:100]
+        subject_code = (request.form.get('subject_code') or 'IMP001').strip().upper()
+        difficulty = request.form.get('difficulty', 'Média')
+        source = (request.form.get('source') or 'PDF importado').strip()[:200]
+        answer_text = request.form.get('answer_key', '')
+        answer_key_pdf = request.files.get('answer_key_pdf')
+        selected_type = request.form.get('question_type', 'multiple_choice')
+        if selected_type not in ('multiple_choice', 'essay'):
+            selected_type = 'multiple_choice'
+        if not pdf or not pdf.filename.lower().endswith('.pdf'):
+            flash('Selecione um arquivo PDF.', 'error')
+            return render_template('import_questions.html')
+        if not re.fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code):
+            flash('O código deve seguir o formato FIS003 (2–5 letras e 3 números).', 'error')
+            return render_template('import_questions.html')
+        if difficulty not in ('Fácil', 'Média', 'Difícil'):
+            difficulty = 'Média'
+        # Primeiro tenta extrair texto digital. Páginas sem texto útil passam pelo OCR.
+        used_ocr = False
+        try:
+            from pypdf import PdfReader
+            from io import BytesIO
+            pdf_bytes = pdf.read()
+            reader = PdfReader(BytesIO(pdf_bytes))
+            pages = []
+            for page in reader.pages:
+                pages.append((page.extract_text() or '').strip())
+
+            # OCR só nas páginas sem texto selecionável, mantendo a ordem original.
+            pages_needing_ocr = [i for i, page_text in enumerate(pages) if len(page_text) < 30]
+            if pages_needing_ocr:
+                try:
+                    import fitz  # PyMuPDF: renderiza páginas do PDF sem depender do Poppler.
+                    import pytesseract
+                    import shutil
+                    from PIL import Image, ImageOps, ImageFilter
+                    tess_cmd = shutil.which('tesseract')
+                    if not tess_cmd:
+                        raise RuntimeError('Executável tesseract ausente. Configure o build do Render para instalar tesseract-ocr e tesseract-ocr-por.')
+                    pytesseract.pytesseract.tesseract_cmd = tess_cmd
+                    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+                    for page_index in pages_needing_ocr:
+                        page = doc.load_page(page_index)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+                        image = Image.open(BytesIO(pix.tobytes('png'))).convert('L')
+                        image = ImageOps.autocontrast(image).filter(ImageFilter.SHARPEN)
+                        try:
+                            langs = pytesseract.get_languages(config='')
+                            lang = 'por+eng' if 'por' in langs and 'eng' in langs else ('por' if 'por' in langs else 'eng')
+                            # Layouts de prova variam; tenta dois modos e conserva o texto mais legível.
+                            candidates = [pytesseract.image_to_string(image, lang=lang, config=f'--oem 3 --psm {psm}') for psm in (3, 6)]
+                            ocr_text = max(candidates, key=lambda value: sum(ch.isalnum() for ch in value))
+                        except Exception as lang_exc:
+                            raise RuntimeError('Tesseract foi encontrado, mas falhou ao carregar idiomas OCR: ' + str(lang_exc)[:140])
+                        pages[page_index] = ocr_text.strip()
+                        used_ocr = used_ocr or len(ocr_text.strip()) > 0
+                    doc.close()
+                except Exception as ocr_exc:
+                    flash('O OCR não conseguiu processar uma ou mais páginas escaneadas. O deploy precisa instalar o executável Tesseract e os idiomas por/eng. Detalhe: ' + str(ocr_exc)[:220], 'error')
+                    return render_template('import_questions.html')
+            full_text = '\n'.join(pages)
+        except Exception as exc:
+            flash('Não foi possível ler o PDF. Verifique se ele não está corrompido. Detalhe: ' + str(exc)[:180], 'error')
+            return render_template('import_questions.html')
+        if len(full_text.strip()) < 30:
+            flash('Não foi possível extrair texto suficiente do PDF, mesmo após tentar OCR. Verifique a qualidade/resolução das páginas.', 'error')
+            return render_template('import_questions.html')
+        if used_ocr:
+            flash('OCR foi usado em uma ou mais páginas. Como o reconhecimento pode confundir letras e números, as questões importadas deste PDF serão marcadas como “Não revisada”.', 'info')
+
+        # Um segundo PDF pode conter apenas o gabarito. O texto digital é preferido;
+        # se for escaneado, tenta OCR usando a mesma instalação do Tesseract.
+        separate_key_text = ''
+        if answer_key_pdf and answer_key_pdf.filename:
+            if not answer_key_pdf.filename.lower().endswith('.pdf'):
+                flash('O arquivo separado de gabarito precisa ser um PDF. O gabarito desse arquivo foi ignorado.', 'error')
+            else:
+                try:
+                    from pypdf import PdfReader
+                    key_bytes = answer_key_pdf.read()
+                    key_reader = PdfReader(BytesIO(key_bytes))
+                    key_pages = [(page.extract_text() or '').strip() for page in key_reader.pages]
+                    key_ocr_pages = [i for i, txt in enumerate(key_pages) if len(txt) < 15]
+                    if key_ocr_pages:
+                        import fitz
+                        import pytesseract
+                        import shutil
+                        from PIL import Image, ImageOps, ImageFilter
+                        tess_cmd = shutil.which('tesseract')
+                        if not tess_cmd:
+                            raise RuntimeError('Tesseract não está instalado no servidor.')
+                        pytesseract.pytesseract.tesseract_cmd = tess_cmd
+                        key_doc = fitz.open(stream=key_bytes, filetype='pdf')
+                        for page_index in key_ocr_pages:
+                            pix = key_doc.load_page(page_index).get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+                            image = ImageOps.autocontrast(Image.open(BytesIO(pix.tobytes('png'))).convert('L')).filter(ImageFilter.SHARPEN)
+                            langs = pytesseract.get_languages(config='')
+                            lang = 'por+eng' if 'por' in langs and 'eng' in langs else ('por' if 'por' in langs else 'eng')
+                            candidates = [pytesseract.image_to_string(image, lang=lang, config=f'--oem 3 --psm {psm}') for psm in (3, 6)]
+                            key_pages[page_index] = max(candidates, key=lambda value: sum(ch.isalnum() for ch in value)).strip()
+                        key_doc.close()
+                    separate_key_text = '\n'.join(key_pages)
+                    if len(separate_key_text.strip()) < 2:
+                        flash('O PDF de gabarito não apresentou texto legível. Confira se o OCR do servidor está instalado.', 'warning')
+                except Exception as key_exc:
+                    flash('Não foi possível ler o PDF separado de gabarito: ' + str(key_exc)[:180], 'warning')
+
+        # Aceita formatos como 1-A, 1. A, Questão 1: A e pares em linhas separadas.
+        answer_source = '\n'.join([full_text, answer_text or '', separate_key_text])
+        answers = {}
+        answer_pattern = r'(?im)(?:quest[aã]o\s*)?(\d{1,4})\s*(?:[\.\)\-:]\s*|\s+)([A-E])\b'
+        for m in re.finditer(answer_pattern, answer_source):
+            answers[int(m.group(1))] = m.group(2).upper()
+        # Separate question body from a trailing answer-key section where possible.
+        body = re.split(r'(?im)^\s*(?:gabarito|respostas?\s+corretas)\s*:?\s*$', full_text)[0]
+        starts = list(re.finditer(r'(?m)^\s*(\d{1,4})\s*[\.\)]\s+', body))
+        if not starts:
+            flash('Não consegui identificar a numeração das questões. Nenhuma questão foi importada.', 'error')
+            return render_template('import_questions.html')
+        imported = uncertain = duplicates = 0
+        seen = set()
+        for idx, start in enumerate(starts):
+            qnum = int(start.group(1))
+            end = starts[idx+1].start() if idx+1 < len(starts) else len(body)
+            chunk = body[start.end():end].strip()
+            # O tipo vem da escolha explícita no formulário, não da inferência do parser.
+            option_matches = list(re.finditer(r'(?im)(?:^|\n)\s*(?:\(([A-E])\)|([A-E])[\)\.])\s+', chunk)) if selected_type == 'multiple_choice' else []
+            statement = chunk[:option_matches[0].start()].strip() if option_matches else chunk
+            choices = []
+            for oi, om in enumerate(option_matches):
+                label = (om.group(1) or om.group(2)).upper()
+                cend = option_matches[oi+1].start() if oi+1 < len(option_matches) else len(chunk)
+                ctext = chunk[om.end():cend].strip()
+                if ctext:
+                    choices.append((label, ctext))
+            statement = re.sub(r'\s+', ' ', statement).strip()
+            norm = re.sub(r'\W+', '', statement.lower())
+            if len(statement) < 15 or norm in seen:
+                duplicates += 1
+                continue
+            seen.add(norm)
+            valid_choices = len(choices) >= 2 and len(choices) <= 5
+            # Não cria questão objetiva sem alternativas: evita quebrar simulados.
+            if selected_type == 'multiple_choice' and not valid_choices:
+                duplicates += 1
+                continue
+            correct_label = answers.get(qnum) if selected_type == 'multiple_choice' else None
+            labels = [c[0] for c in choices]
+            question_type = selected_type
+            status = 'Não revisada' if (used_ocr or len(statement) < 35 or (selected_type == 'multiple_choice' and (not correct_label or correct_label not in labels))) else 'Revisada'
+            q = Question(statement=statement, subject=subject, subject_code=subject_code,
+                         difficulty=difficulty, source=source, created_by=current_user.id,
+                         review_status=status, question_type=question_type,
+                         expected_answer=None,
+                         explanation='Importada automaticamente do PDF. Confira o enunciado, as alternativas e o gabarito.' if status == 'Não revisada' else None)
+            db.session.add(q); db.session.flush()
+            if selected_type == 'multiple_choice':
+                for pos, (label, ctext) in enumerate(choices):
+                    db.session.add(Choice(question_id=q.id, text=ctext,
+                                          is_correct=(correct_label is not None and label == correct_label),
+                                          position=pos))
+            imported += 1
+            if status == 'Não revisada': uncertain += 1
+        db.session.commit()
+        skipped_note = ' ignorada(s) por duplicidade, extração inválida ou falta de alternativas (em múltipla escolha).'
+        flash(f'Importação concluída: {imported} questão(ões) adicionada(s), {uncertain} marcada(s) como “Não revisada” e {duplicates}' + skipped_note, 'success')
+        return redirect(url_for('questions', review='Não revisada'))
+    return render_template('import_questions.html')
 
 @app.route('/questions')
 def questions():
@@ -244,18 +435,25 @@ def new_question():
         subject_code = request.form.get('subject_code','').strip().upper()
         difficulty = request.form.get('difficulty','').strip(); source = request.form.get('source','').strip() or 'Não informada'
         explanation = request.form.get('explanation','').strip()
+        question_type = request.form.get('question_type','multiple_choice')
+        expected_answer = request.form.get('expected_answer','').strip()
         texts = [t.strip() for t in request.form.getlist('choice_text[]') if t.strip()]
         correct_index = request.form.get('correct_index','')
-        if len(statement) < 5 or not subject or not subject_code or not __import__('re').fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code) or difficulty not in ('Fácil','Média','Difícil') or len(texts) < 2:
-            flash('Informe enunciado, assunto, código no formato FIS003, dificuldade e pelo menos duas alternativas.', 'error')
-        elif not correct_index.isdigit() or int(correct_index) >= len(texts):
-            flash('Selecione a alternativa correta.', 'error')
+        valid_base = len(statement) >= 5 and bool(subject) and bool(subject_code) and bool(__import__('re').fullmatch(r'[A-Z]{2,5}[0-9]{3}', subject_code)) and difficulty in ('Fácil','Média','Difícil')
+        if not valid_base or question_type not in ('multiple_choice','essay'):
+            flash('Informe enunciado, assunto, código FIS003 válido e dificuldade.', 'error')
+        elif question_type == 'multiple_choice' and (len(texts) < 2 or not correct_index.isdigit() or int(correct_index) >= len(texts)):
+            flash('Questões de múltipla escolha precisam de pelo menos duas alternativas e um gabarito.', 'error')
         else:
-            q = Question(statement=statement, subject=subject, subject_code=subject_code, difficulty=difficulty, source=source, explanation=explanation or None, created_by=current_user.id)
+            q = Question(statement=statement, subject=subject, subject_code=subject_code, difficulty=difficulty, source=source,
+                         explanation=explanation or None, created_by=current_user.id, question_type=question_type,
+                         expected_answer=(expected_answer or None) if question_type == 'essay' else None)
             db.session.add(q); db.session.flush()
-            correct = int(correct_index)
-            for i, text in enumerate(texts): db.session.add(Choice(question_id=q.id, text=text, is_correct=(i==correct), position=i))
-            db.session.commit(); flash('Questão adicionada ao banco!', 'success'); return redirect(url_for('question_detail', question_id=q.id))
+            if question_type == 'multiple_choice':
+                correct = int(correct_index)
+                for i, choice_text in enumerate(texts): db.session.add(Choice(question_id=q.id, text=choice_text, is_correct=(i==correct), position=i))
+            db.session.commit(); flash('Questão dissertativa adicionada!' if question_type == 'essay' else 'Questão adicionada ao banco!', 'success')
+            return redirect(url_for('question_detail', question_id=q.id))
     return render_template('question_new.html')
 
 @app.route('/questions/<int:question_id>')
@@ -268,12 +466,20 @@ def question_detail(question_id):
 @login_required
 def answer_question(question_id):
     q = db.session.get(Question, question_id) or abort(404)
+    if q.question_type == 'essay':
+        answer_text = request.form.get('answer_text', '').strip()
+        if len(answer_text) < 1:
+            flash('Escreva sua resposta antes de enviar.', 'error')
+            return redirect(url_for('question_detail', question_id=q.id))
+        db.session.add(EssayResponse(user_id=current_user.id, question_id=q.id, answer_text=answer_text))
+        db.session.commit()
+        return render_template('answer_result.html', q=q, choice=None, correct=None, essay_answer=answer_text)
     try: choice_id = int(request.form.get('choice_id',''))
     except ValueError: abort(400)
     choice = Choice.query.filter_by(id=choice_id, question_id=q.id).first_or_404()
     attempt = Attempt(user_id=current_user.id, question_id=q.id, choice_id=choice.id, is_correct=choice.is_correct, mode='study')
     db.session.add(attempt); db.session.commit()
-    return render_template('answer_result.html', q=q, choice=choice, correct=choice.is_correct)
+    return render_template('answer_result.html', q=q, choice=choice, correct=choice.is_correct, essay_answer=None)
 
 
 @app.route('/subjects')
@@ -339,7 +545,7 @@ def leaderboard():
     users = User.query.order_by(User.username).all(); rows=[]
     for user in users:
         attempts = Attempt.query.filter_by(user_id=user.id).all()
-        total = len(attempts); correct = sum(a.is_correct for a in attempts)
+        total = len(attempts); correct = sum(a.is_correct is True for a in attempts)
         rows.append({'username':user.username, 'total':total, 'correct':correct, 'pct':round(correct*100/total,1) if total else 0})
     rows.sort(key=lambda r:(r['pct'] if r['total'] else -1, r['total']), reverse=True)
     return render_template('leaderboard.html', rows=rows)
@@ -377,10 +583,17 @@ def take_exam(exam_id):
         answers={}
         if request.method=='POST' and remaining>0:
             for q in qs:
-                val=request.form.get(f'q_{q.id}')
-                if val and val.isdigit() and any(c.id==int(val) for c in q.choices): answers[str(q.id)]=int(val)
+                val=request.form.get(f'q_{q.id}', '').strip()
+                if q.question_type == 'essay':
+                    if val:
+                        answers[str(q.id)] = val
+                        db.session.add(EssayResponse(user_id=current_user.id, question_id=q.id, answer_text=val))
+                elif val.isdigit() and any(c.id==int(val) for c in q.choices):
+                    answers[str(q.id)]=int(val)
         score=0
         for q in qs:
+            if q.question_type == 'essay':
+                continue
             cid=answers.get(str(q.id)); choice=next((c for c in q.choices if c.id==cid),None)
             if choice:
                 db.session.add(Attempt(user_id=current_user.id,question_id=q.id,choice_id=choice.id,is_correct=choice.is_correct,mode='exam'))
@@ -396,10 +609,43 @@ def exam_result(exam_id):
     if not exam.finished_at: return redirect(url_for('take_exam',exam_id=exam.id))
     answers=json.loads(exam.answers_json or '{}'); qs=[db.session.get(Question,qid) for qid in json.loads(exam.question_ids)]; qs=[q for q in qs if q]
     details=[]
+    graded_total=sum(1 for q in qs if q.question_type != 'essay')
     for q in qs:
-        cid=answers.get(str(q.id)); chosen=next((c for c in q.choices if c.id==cid),None); correct=next((c for c in q.choices if c.is_correct),None)
-        details.append({'q':q,'chosen':chosen,'correct':correct,'ok':bool(chosen and chosen.is_correct)})
-    return render_template('exam_result.html', exam=exam, details=details, total=len(qs), pct=round((exam.score or 0)*100/len(qs),1) if qs else 0)
+        answer=answers.get(str(q.id))
+        if q.question_type == 'essay':
+            details.append({'q':q,'chosen':None,'answer_text':answer if isinstance(answer,str) else None,'correct':None,'ok':None,'manual':True})
+        else:
+            cid=answer if isinstance(answer,int) else None
+            chosen=next((c for c in q.choices if c.id==cid),None); correct=next((c for c in q.choices if c.is_correct),None)
+            details.append({'q':q,'chosen':chosen,'answer_text':None,'correct':correct,'ok':bool(chosen and chosen.is_correct),'manual':False})
+    return render_template('exam_result.html', exam=exam, details=details, total=len(qs), graded_total=graded_total, pct=round((exam.score or 0)*100/graded_total,1) if graded_total else 0)
+
+@app.route('/admin/questions/<int:question_id>/delete', methods=['POST'])
+@login_required
+def admin_delete_question(question_id):
+    if not backup_admin_required(): abort(403)
+    q = db.session.get(Question, question_id) or abort(404)
+    Attempt.query.filter_by(question_id=q.id).delete(synchronize_session=False)
+    EssayResponse.query.filter_by(question_id=q.id).delete(synchronize_session=False)
+    db.session.delete(q)
+    db.session.commit()
+    flash(f'Questão #{question_id} excluída.', 'success')
+    return redirect(url_for('questions'))
+
+@app.route('/admin/database/reset', methods=['POST'])
+@login_required
+def admin_reset_database():
+    if not backup_admin_required(): abort(403)
+    confirmation = request.form.get('confirmation', '').strip()
+    if confirmation != 'RESETAR':
+        flash('Reset cancelado: digite RESETAR exatamente para confirmar.', 'error')
+        return redirect(url_for('backups_page'))
+    # Preserve user accounts and the configured admin login, but erase study content/progress.
+    with db.engine.begin() as conn:
+        for model in (EssayResponse, Attempt, ExamSession, Choice, Question, StudyMaterial, SubjectCode):
+            conn.execute(model.__table__.delete())
+    flash('Banco de estudos resetado. Contas de usuário foram preservadas; questões, materiais e progresso foram apagados.', 'success')
+    return redirect(url_for('backups_page'))
 
 @app.route('/admin/backups', methods=['GET'])
 @login_required
@@ -507,3 +753,22 @@ with app.app_context():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=os.environ.get('FLASK_DEBUG') == '1')
+
+
+# Safe additive migration for existing databases (does not delete or rewrite questions).
+with app.app_context():
+    db.create_all()
+    try:
+        from sqlalchemy import inspect
+        inspector = inspect(db.engine)
+        if 'question' in inspector.get_table_names():
+            cols = {c['name'] for c in inspector.get_columns('question')}
+            with db.engine.begin() as conn:
+                if 'review_status' not in cols:
+                    conn.execute(text("ALTER TABLE question ADD COLUMN review_status VARCHAR(30) NOT NULL DEFAULT 'Revisada'"))
+                if 'question_type' not in cols:
+                    conn.execute(text("ALTER TABLE question ADD COLUMN question_type VARCHAR(24) NOT NULL DEFAULT 'multiple_choice'"))
+                if 'expected_answer' not in cols:
+                    conn.execute(text('ALTER TABLE question ADD COLUMN expected_answer TEXT'))
+    except Exception as migration_error:
+        app.logger.warning("Question review-status migration will retry on next startup: %s", migration_error)

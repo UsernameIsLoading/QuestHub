@@ -2,7 +2,7 @@ services:
   - type: web
     name: questhub
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: apt-get update && apt-get install -y tesseract-ocr tesseract-ocr-por tesseract-ocr-eng && pip install -r requirements.txt
     startCommand: gunicorn app:app
     plan: free
     envVars:
@@ -16,6 +16,8 @@ services:
           property: connectionString
       - key: COOKIE_SECURE
         value: "true"
+      - key: BACKUP_ADMIN_USERNAME
+        sync: false
 databases:
   - name: questhub-db
     plan: free
