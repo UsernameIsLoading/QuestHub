@@ -206,13 +206,13 @@ def gemini_json(system_prompt, user_prompt, schema_name, schema):
         raise RuntimeError('O Gemini retornou uma resposta JSON inválida.') from exc
 
 QUESTION_SCHEMA = {
-    'type': 'object', 'additionalProperties': False,
+    'type': 'object', 
     'properties': {'questions': {'type': 'array', 'items': {
-        'type': 'object', 'additionalProperties': False,
+        'type': 'object', 
         'properties': {
             'number': {'type': 'integer'}, 'statement': {'type': 'string'},
             'question_type': {'type': 'string', 'enum': ['multiple_choice', 'essay']},
-            'choices': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
+            'choices': {'type': 'array', 'items': {'type': 'object', 
                 'properties': {'label': {'type': 'string'}, 'text': {'type': 'string'}}, 'required': ['label', 'text']}},
             'correct_label': {'type': 'string'}, 'expected_answer': {'type': 'string'},
             'explanation': {'type': 'string'},
@@ -222,7 +222,7 @@ QUESTION_SCHEMA = {
 }
 
 FEEDBACK_SCHEMA = {
-    'type': 'object', 'additionalProperties': False,
+    'type': 'object', 
     'properties': {'suggested_answer': {'type': 'string'}, 'assessment': {'type': 'string'},
                    'explanation': {'type': 'string'}, 'confidence': {'type': 'string', 'enum': ['baixa', 'média', 'alta']}},
     'required': ['suggested_answer', 'assessment', 'explanation', 'confidence']
